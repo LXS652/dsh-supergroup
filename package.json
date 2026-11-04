@@ -1,9 +1,17 @@
 {
   "name": "dsh-supergroup",
   "version": "1.0.0",
-  "description": "DeepSeek Harness 插件：按会话寻址的持久多整体协作，带侧栏面板、持久账本与重启对账。",
+  "description": "DSH 多会话编排插件：按会话 ID 派工、按 rpcId 回收结果、重启后自动对账自愈。",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LXS652/dsh-supergroup.git"
+  },
+  "homepage": "https://github.com/LXS652/dsh-supergroup",
+  "bugs": {
+    "url": "https://github.com/LXS652/dsh-supergroup/issues"
+  },
   "exports": {
     ".": "./src/plugin2.mjs",
     "./client": "./client/client.js"
@@ -25,10 +33,10 @@
     }
   },
   "keywords": [
-    "deepseek-harness",
     "dsh",
-    "agent",
+    "deepseek-harness",
+    "multi-agent",
     "orchestration",
-    "multi-session"
+    "plugin"
   ]
 }

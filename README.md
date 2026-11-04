@@ -1,8 +1,10 @@
 # dsh-supergroup · DSH 超级代理部署
 
-一个 DeepSeek Harness（DSH）插件：把多个持久会话组织成「整体」，按 `sessionId` 寻址派工，用持久账本记录工单，并在重启后用会话历史对账把结果收回来。
+dsh-supergroup 是 DeepSeek Harness 的一组会话编排插件。它把一个主会话和若干执行会话组成一个「整体」：主会话负责拆解与派工，执行会话各干各的，结果按投递时生成的 `rpcId` 精确回到主会话，不会把别人的输出误当成自己的结果。
 
-它不是一次性子代理调用。整体、成员、工单、恢复状态都落在文件里，宿主重启后仍然存在。
+侧栏面板可以创建、改名、增删成员、解散整体；名单与工单账本都落盘，宿主重启后会在启动时自动对账，把「投递了但没等到结算」的工单按历史证据收敛，从不自动重发——因为外部副作用可能已经发生了。
+
+安装只需要往 DSH profile 里加一个 `insert` 条目，无外部依赖。
 
 ## 能力
 
@@ -26,7 +28,7 @@
 
 ```yaml
 - id: dsh-supergroup
-  plugin: <你的路径>/dsh-supergroup
+  plugin: <你的工作区>/dsh-supergroup
   config:
     registryFile: <你的 DSH_HOME>/data/registry.json
     groupsFile: <你的 DSH_HOME>/data/groups.json
