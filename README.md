@@ -19,21 +19,54 @@ dsh-supergroup 是 DeepSeek Harness 的一组会话编排插件。它把一个�
 
 ## 安装
 
-1. 把本目录放到你希望长期保留的位置。
-2. 在 DSH profile 的插件 `insert` 配置里加入一个条目，指向本目录的入口 `src/plugin2.mjs`，并配置下面三个文件路径。
-3. 重启宿主（或重新加载 profile），侧栏会出现「超级代理部署」图标。
-4. 客户端 bundle 不会热更；改完 `client/client.js` 后需要重启宿主才能看到界面变化。
+当前版本有两条安装路径。**新装优先走路 A**：直接改 profile 的 patch 文件，不依赖 bundle 机制。
 
-配置示例（把 `<...>` 换成你自己的路径，不要照抄真实用户名）：
+### 路 A（推荐，当前真实可用）
+
+1. 把本目录放到一个固定位置，确认入口文件存在：`<你的工作区>/dsh-supergroup/src/plugin2.mjs`。
+2. 打开 `~/.dsh/profiles/<profile>/cordis.patch.yml`，在**文件末尾追加**：
 
 ```yaml
-- id: dsh-supergroup
-  plugin: <你的工作区>/dsh-supergroup
-  config:
-    registryFile: <你的 DSH_HOME>/data/registry.json
-    groupsFile: <你的 DSH_HOME>/data/groups.json
-    ledgerFile: <你的 DSH_HOME>/data/tasks.jsonl
+- insert:
+    - id: dsh-supergroup
+      name: file:///<你的工作区>/dsh-supergroup/src/plugin2.mjs
+      config:
+        registryFile: '<你的 DSH_HOME>\data\registry.json'
+        groupsFile: '<你的 DSH_HOME>\data\groups.json'
+        ledgerFile: '<你的 DSH_HOME>\data\tasks.jsonl'
 ```
+
+3. 重启 DSH。侧栏应出现「超级代理部署」图标，`ms2_status` 应可用。
+4. `name` 必须是**绝对路径**的 `file:///` 形式，并指向**入口文件**；Windows 路径把反斜杠写成 `/`。`<profile>` 换成你的 profile 目录名。
+
+### 路 B：作为 bundle 安装
+
+bundle 方式要求以下三件事同时成立，缺一不会加载：
+
+1. profile 的 `package.json` 在 `dependencies` 里登记本包，例如 `"dsh-supergroup": "file:<你的工作区>/dsh-supergroup"`；
+2. 同一个 `package.json` 的 `dsh.profile.bundles` 数组包含 `"dsh-supergroup"`；
+3. 在 profile 目录执行 `pnpm install`（或你的 DSH 版本提供的等价安装步骤），让包真正进入 `node_modules`。
+
+三者齐备后，bundle 会读取包内的 `cordis.patch.yml`；其中 `name` 使用包名 `dsh-supergroup`，不是 `file://` 路径。
+
+### 不要这样写
+
+- **不要用 `plugin:` 字段**。rc.5 的 patch 结构是 `{ id, insert?, name?, ...overrides }`，`plugin:` 不是入口字段。
+- **不要裸写 `- id: dsh-supergroup` 而不包在 `insert:` 里**。没有对应的已有条目时，它会被当成覆盖，宿主只记一条 `patch: entry ... not found` 然后静默跳过。
+- **路 A 的 `name` 不要指向目录**，必须指向入口文件 `src/plugin2.mjs`（`file:///` 形式）。
+
+### 装完没反应怎么查
+
+1. 确认改的是当前 profile 的 `cordis.patch.yml`，且条目追加在文件末尾、位于 `insert:` 列表内。
+2. 用 `dsh --dump-config` 看最终配置。Desktop 的 profile 可能被 Electron 独占，先复制一份再对副本 dump：
+
+   ```bash
+   cp -al ~/.dsh/profiles/<profile> ~/.dsh/profiles/<profile>-probe
+   ```
+
+   然后按你的 DSH 版本支持的方式让 CLI 使用 `<profile>-probe`，执行 `dsh --dump-config 2> dump.err`。
+3. `grep dsh-supergroup` 检查 dump 输出；若 stderr 出现 `patch: entry ... not found`，说明条目没有进入 `insert:`，或 id 写错。
+4. 仍无图标时，再确认入口文件存在、`name` 是 `file:///` 文件 URL，并且 DSH 已完全重启（客户端 bundle 不热更）。
 
 `groupsFile` 省略时会跟着 `registryFile` 走，落在同一目录的 `groups.json`；`eventsLogFile` 省略时落在账本同目录的 `session-events.log`。
 

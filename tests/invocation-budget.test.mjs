@@ -1,20 +1,19 @@
 /**
  * 主机调用预算回归测试；创建者：DeepSeek Harness，2026-11-02。
- * 只运行 Node 内置模块及本配额模块；测试数据库保留在 tests/budget-runtime。
+ * 只运行 Node 内置模块及本配额模块；测试数据库暂存在系统临时目录，不写源码树。
  * 子进程仅执行本模块，不启动 DSH、不访问网络、不删除测试数据。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdtempSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { InvocationBudget } from '../src/core/invocation-budget.mjs';
 
-const runtimeRoot = join(dirname(fileURLToPath(import.meta.url)), 'budget-runtime');
+const runtimeRoot = mkdtempSync(join(tmpdir(), 'dsh-supergroup-budget-'));
 const moduleUrl = new URL('../src/core/invocation-budget.mjs', import.meta.url).href;
-mkdirSync(runtimeRoot, { recursive: true });
 
 /** 为测试创建独立目录及默认配置；测试结束仅关闭句柄。 */
 function fixture(overrides = {}) {

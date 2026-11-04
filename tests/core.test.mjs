@@ -1,20 +1,19 @@
 /**
  * 持久调度器回归测试；创建者：DeepSeek Harness，2026-11-02。
- * 仅执行本项目核心和 Node 内置模块。测试库留存在项目内，不做删除。
+ * 仅执行本项目核心和 Node 内置模块。测试库暂存在系统临时目录，不写源码树。
  * 崩溃子进程仅为本测试创建的 Node 子进程，不加载 DSH。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
-import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { DurableScheduler } from '../src/core/scheduler.mjs';
 
-const runtimeRoot = join(dirname(fileURLToPath(import.meta.url)), '.core-runtime');
-mkdirSync(runtimeRoot, { recursive: true });
+const runtimeRoot = mkdtempSync(join(tmpdir(), 'dsh-supergroup-core-'));
 const moduleUrl = new URL('../src/core/scheduler.mjs', import.meta.url).href;
 
 /** 为每个测试分配独立且保留的项目内目录；返回调度器及可控时钟。 */

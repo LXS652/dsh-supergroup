@@ -1,0 +1,9 @@
+# dsh-supergroup bundle 入口。
+# 安装者需要把 <你的 DSH_HOME> 替换为实际 DSH 主目录；三个路径都由安装环境决定。
+- insert:
+    - id: dsh-supergroup
+      name: dsh-supergroup
+      config:
+        registryFile: '<你的 DSH_HOME>/data/registry.json'
+        groupsFile: '<你的 DSH_HOME>/data/groups.json'
+        ledgerFile: '<你的 DSH_HOME>/data/tasks.jsonl'
