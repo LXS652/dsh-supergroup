@@ -7,10 +7,19 @@
  *
  * 协调方式仍是“按 sessionId 寻址”——不依赖原生 Team，也不要求执行会话装本插件。
  */
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { appendFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import {
+    appendFileSync,
+    copyFileSync,
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    statSync,
+    writeFileSync
+} from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { Coordinator } from './core/coordinator.mjs';
 import { GroupsStore } from './core/groups.mjs';
@@ -22,10 +31,99 @@ import { runCommand } from './core/commands.mjs';
 export const name = 'dsh-supergroup';
 export const inject = ['tools', 'commands'];
 
-const DEFAULT_GROUPS = fileURLToPath(new URL('../data/groups.json', import.meta.url));
-const DEFAULT_REGISTRY = fileURLToPath(new URL('../data/registry.json', import.meta.url));
-const DEFAULT_LEDGER = fileURLToPath(new URL('../data/tasks.jsonl', import.meta.url));
-const DEFAULT_REPORT_DIR = fileURLToPath(new URL('../probe2/', import.meta.url));
+const LEGACY_DATA_DIR = fileURLToPath(new URL('../data/', import.meta.url));
+const LEGACY_FILES = ['groups.json', 'tasks.jsonl', 'registry.json'];
+
+/** 解析数据根：显式 dataDir → DSH_HOME → ~/.dsh；必须是绝对路径。 */
+function resolveDshHome(config) {
+    const configured = config && typeof config.dataDir === 'string' ? config.dataDir.trim() : '';
+    const configuredEnv = typeof process.env.DSH_HOME === 'string' ? process.env.DSH_HOME.trim() : '';
+    const base = configured !== '' ? configured : (configuredEnv !== '' ? configuredEnv : join(homedir(), '.dsh'));
+    if (!isAbsolute(base)) throw new Error('DATA_DIR_NOT_ABSOLUTE');
+    mkdirSync(base, { recursive: true });
+    return base;
+}
+
+/**
+ * 解析运行期路径。显式文件配置优先（测试与自定义安装），否则落到
+ * <DSH_HOME>/supergroup/。所有目录在 apply 同步建立，失败直接报给调用方。
+ */
+function resolveDataPaths(config) {
+    const cfg = config && typeof config === 'object' ? config : {};
+    const explicitRegistry = typeof cfg.registryFile === 'string' ? cfg.registryFile : null;
+    const explicitGroups = typeof cfg.groupsFile === 'string' ? cfg.groupsFile : null;
+    const explicitLedger = typeof cfg.ledgerFile === 'string' ? cfg.ledgerFile : null;
+
+    let dataDir;
+    if (typeof cfg.dataDir === 'string' && cfg.dataDir.trim() !== '') {
+        dataDir = resolveDshHome(cfg);
+    } else if (explicitGroups !== null || explicitRegistry !== null || explicitLedger !== null) {
+        dataDir = dirname(explicitGroups ?? explicitRegistry ?? explicitLedger);
+        if (!isAbsolute(dataDir)) throw new Error('DATA_DIR_NOT_ABSOLUTE');
+        mkdirSync(dataDir, { recursive: true });
+    } else {
+        dataDir = join(resolveDshHome(cfg), 'supergroup');
+        mkdirSync(dataDir, { recursive: true });
+    }
+
+    const registryFile = explicitRegistry ?? join(dataDir, 'registry.json');
+    const groupsFile = explicitGroups ?? (explicitRegistry !== null ? join(dirname(explicitRegistry), 'groups.json') : join(dataDir, 'groups.json'));
+    const ledgerFile = explicitLedger ?? join(dataDir, 'tasks.jsonl');
+    const eventLogFile = typeof cfg.eventsLogFile === 'string'
+        ? cfg.eventsLogFile
+        : join(dirname(ledgerFile), 'session-events.log');
+    return {
+        dataDir,
+        registryFile,
+        groupsFile,
+        ledgerFile,
+        eventLogFile,
+        reportDir: join(dataDir, 'reports'),
+        pluginLog: join(dataDir, 'plugin.log'),
+        lockFile: join(dataDir, '.instance.lock'),
+        migrationMarker: join(dataDir, '.migrated')
+    };
+}
+
+/** 只追加一行 JSON；日志失败不得阻断插件。 */
+function appendJsonLine(file, entry, onError) {
+    try {
+        appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+    } catch (error) {
+        if (typeof onError === 'function') onError(error);
+    }
+}
+
+/**
+ * 旧版数据在包目录 ../data/。按文件逐个补到新数据根，不用“目录存在”判断新旧；
+ * 三个核心文件都到位才写 .migrated，session-events.log 不计入完整性。
+ */
+function migrateLegacyData(paths, log) {
+    if (resolve(paths.dataDir) === resolve(LEGACY_DATA_DIR)) return;
+    if (existsSync(paths.migrationMarker)) return;
+    if (!existsSync(LEGACY_DATA_DIR)) return;
+    let copied = 0;
+    for (const name of LEGACY_FILES) {
+        const source = join(LEGACY_DATA_DIR, name);
+        const target = join(paths.dataDir, name);
+        try {
+            if (existsSync(source) && !existsSync(target)) {
+                copyFileSync(source, target);
+                copied += 1;
+            }
+        } catch (error) {
+            log({ event: 'legacy-copy-error', file: name, error: error instanceof Error ? error.message : String(error) });
+        }
+    }
+    const complete = LEGACY_FILES.every(name => existsSync(join(paths.dataDir, name)));
+    if (!complete) return;
+    try {
+        writeFileSync(paths.migrationMarker, `${JSON.stringify({ at: new Date().toISOString(), source: LEGACY_DATA_DIR, copied }, null, 2)}\n`, 'utf8');
+    } catch (error) {
+        log({ event: 'migration-marker-error', error: error instanceof Error ? error.message : String(error) });
+    }
+    log({ event: 'legacy-migration', copied, complete });
+}
 
 /** 写一份人能读的 JSON 报告；失败不抛，报告不是主流程。 */
 async function writeReport(directory, payload) {
@@ -84,19 +182,27 @@ function parseJson(raw, hint) {
 }
 
 export function apply(ctx, config) {
-    // 整体名单与旧名单放同一目录：显式给了 groupsFile 就用它，否则跟着 registryFile 走，
-    // 这样测试与真实数据各自隔离，不会互相写到对方文件里。
-    const groupsFile = config && typeof config.groupsFile === 'string'
-        ? config.groupsFile
-        : (config && typeof config.registryFile === 'string'
-            ? join(dirname(config.registryFile), 'groups.json')
-            : DEFAULT_GROUPS);
-    const legacyFile = config && typeof config.registryFile === 'string' ? config.registryFile : DEFAULT_REGISTRY;
-    const ledgerFile = config && typeof config.ledgerFile === 'string' ? config.ledgerFile : DEFAULT_LEDGER;
-    // 事件观测日志和账本放同一目录；测试显式传 eventsLogFile 隔离。
-    const eventLogFile = config && typeof config.eventsLogFile === 'string'
-        ? config.eventsLogFile
-        : join(dirname(ledgerFile), 'session-events.log');
+    let paths;
+    try {
+        paths = resolveDataPaths(config);
+    } catch (error) {
+        console.error(`dsh-supergroup: 数据目录解析失败：${error instanceof Error ? error.message : String(error)}`);
+        return;
+    }
+    let logErrorReported = false;
+    const log = (entry) => appendJsonLine(paths.pluginLog, entry, (error) => {
+        if (logErrorReported) return;
+        logErrorReported = true;
+        console.error(`dsh-supergroup: plugin.log 写入失败：${error instanceof Error ? error.message : String(error)}`);
+    });
+    // 启动首行：把实际解析出的数据根写进日志，现场排查不必猜路径。
+    log({ event: 'startup', dataDir: paths.dataDir, pid: process.pid });
+    migrateLegacyData(paths, log);
+
+    const { groupsFile, ledgerFile, eventLogFile } = paths;
+    // 旧 registry 回退与数据根同目录；测试显式 registryFile 时也按它走。
+    const legacyFile = paths.registryFile;
+    const DEFAULT_REPORT_DIR = paths.reportDir;
     const EVENT_LOG_LIMIT = 256 * 1024;
     // 启动期 sessionController 可能晚于插件装载；最多等 50×200ms（约 10s），
     // 测试可缩小次数/间隔，但上限仍被夹在 50 次、200ms，避免启动被无限拖住。
@@ -139,6 +245,7 @@ export function apply(ctx, config) {
     const safetyTools = typeof safety.get === 'function' ? safety.get('tools') : undefined;
 
     const state = {
+        dataDir: paths.dataDir,
         groups: null,
         coordinators: new Map(),
         channel: null,
