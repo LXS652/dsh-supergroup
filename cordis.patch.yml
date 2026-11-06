@@ -1,9 +1,6 @@
 # dsh-supergroup bundle 入口。
-# 安装者需要把 <你的 DSH_HOME> 替换为实际 DSH 主目录；三个路径都由安装环境决定。
+# 身份五方一致：package.json.name = insert id = insert name = 客户端模块 id。
+# 数据文件默认在包目录下的 data/；安装时可用 config 显式指定路径。
 - insert:
     - id: dsh-supergroup
       name: dsh-supergroup
-      config:
-        registryFile: '<你的 DSH_HOME>/data/registry.json'
-        groupsFile: '<你的 DSH_HOME>/data/groups.json'
-        ledgerFile: '<你的 DSH_HOME>/data/tasks.jsonl'
