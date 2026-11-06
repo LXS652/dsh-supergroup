@@ -11,12 +11,16 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
     appendFileSync,
+    closeSync,
     copyFileSync,
     existsSync,
     mkdirSync,
+    openSync,
     readFileSync,
     statSync,
-    writeFileSync
+    unlinkSync,
+    writeFileSync,
+    writeSync
 } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -125,6 +129,65 @@ function migrateLegacyData(paths, log) {
     log({ event: 'legacy-migration', copied, complete });
 }
 
+/** 判断 pid 是否还活着；EPERM 说明进程存在但无权发信号，也按活着算。 */
+function isProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return error && error.code === 'EPERM';
+    }
+}
+
+/**
+ * 跨进程单实例锁：apply 一开始同步抢占，抢不到直接返回。
+ * 锁文件只含 {pid,at}；死进程留下的锁会被回收，回收后继续抢。
+ */
+function acquireInstanceLock(lockFile) {
+    const payload = `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`;
+    let reclaimed = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+            const fd = openSync(lockFile, 'wx');
+            try {
+                writeSync(fd, payload, null, 'utf8');
+            } finally {
+                closeSync(fd);
+            }
+            return { acquired: true, reclaimed };
+        } catch (error) {
+            if (error === null || error === undefined || error.code !== 'EEXIST') {
+                return { acquired: false, error };
+            }
+        }
+        let pid = null;
+        try {
+            const parsed = JSON.parse(readFileSync(lockFile, 'utf8'));
+            pid = Number.isSafeInteger(parsed.pid) ? parsed.pid : null;
+        } catch {
+            pid = null;
+        }
+        if (pid !== null && isProcessAlive(pid)) return { acquired: false, pid };
+        try {
+            unlinkSync(lockFile);
+            if (pid !== null) reclaimed = pid;
+        } catch (error) {
+            return { acquired: false, error };
+        }
+    }
+    return { acquired: false, error: new Error('INSTANCE_LOCK_RETRY_FAILED') };
+}
+
+/** 只删自己持有的锁；别的进程接管后不能误删。 */
+function releaseInstanceLock(lockFile) {
+    try {
+        const parsed = JSON.parse(readFileSync(lockFile, 'utf8'));
+        if (parsed.pid === process.pid) unlinkSync(lockFile);
+    } catch {
+        // 锁已不存在或内容损坏：退出时忽略。
+    }
+}
+
 /** 写一份人能读的 JSON 报告；失败不抛，报告不是主流程。 */
 async function writeReport(directory, payload) {
     try {
@@ -195,6 +258,26 @@ export function apply(ctx, config) {
         logErrorReported = true;
         console.error(`dsh-supergroup: plugin.log 写入失败：${error instanceof Error ? error.message : String(error)}`);
     });
+    // 单实例锁必须在 apply 最开头、ready 启动之前同步拿到；抢不到就不注册工具。
+    const lock = acquireInstanceLock(paths.lockFile);
+    if (!lock.acquired) {
+        if (lock.pid !== undefined && lock.pid !== null) {
+            log({ event: 'lock-busy', pid: lock.pid });
+            console.warn(`dsh-supergroup: lock busy pid=${lock.pid}`);
+        } else {
+            log({ event: 'lock-error', error: lock.error instanceof Error ? lock.error.message : String(lock.error) });
+            console.error(`dsh-supergroup: 单实例锁创建失败：${lock.error instanceof Error ? lock.error.message : String(lock.error)}`);
+        }
+        return;
+    }
+    if (lock.reclaimed !== null && lock.reclaimed !== undefined) log({ event: 'lock-reclaimed', stalePid: lock.reclaimed });
+    if (typeof ctx.effect === 'function') {
+        try {
+            ctx.effect(() => () => releaseInstanceLock(paths.lockFile), 'dsh-supergroup-instance-lock');
+        } catch (error) {
+            log({ event: 'lock-dispose-register-error', error: error instanceof Error ? error.message : String(error) });
+        }
+    }
     // 启动首行：把实际解析出的数据根写进日志，现场排查不必猜路径。
     log({ event: 'startup', dataDir: paths.dataDir, pid: process.pid });
     migrateLegacyData(paths, log);
