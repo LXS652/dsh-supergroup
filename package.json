@@ -12,13 +12,18 @@
   "bugs": {
     "url": "https://github.com/LXS652/dsh-supergroup/issues"
   },
+  "icon": "./icon.svg",
   "exports": {
     ".": "./src/plugin2.mjs",
-    "./client": "./client/client.js"
+    "./client": "./client/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "src",
     "client",
+    "locale",
+    "icon.svg",
     "docs",
     "README.md",
     "LICENSE",
