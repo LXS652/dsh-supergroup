@@ -36,7 +36,7 @@ v1.1 起推荐把本包作为 profile 的 bundle 安装。只有不装包、临�
    - profile 的 `package.json` 的 `dependencies` 里有 `dsh-supergroup`；
    - 同一个 `package.json` 的 `dsh.profile.bundles` 数组里有 `dsh-supergroup`。
 
-   `dsh plugin add` 在 1.1.0 实测会自动写入 bundles；若你的 DSH 版本没有写入，手工追加一项。
+   `dsh plugin add` 从 1.1.0 起实测会自动写入 bundles；若你的 DSH 版本没有写入，手工追加一项。
 
 3. 确认 `node_modules/dsh-supergroup` 存在；必要时在 profile 目录执行 `pnpm install`。
 
@@ -70,7 +70,7 @@ v1.1 起推荐把本包作为 profile 的 bundle 安装。只有不装包、临�
 - **不要裸写 `- id: dsh-supergroup` 而不包在 `insert:` 里**。没有对应的已有条目时，它会被当成覆盖，宿主只记一条 `patch: entry ... not found` 然后静默跳过。
 - **路 B 的 `name` 不要指向目录**，必须指向入口文件 `src/plugin2.mjs`（`file:///` 形式）。
 
-### 从 1.0.x 升级到 1.1.0
+### 从 1.0.x 升级到 1.2.0
 
 1. 数据目录迁到 `$DSH_HOME/supergroup`；首次启动按文件冷迁移 `groups.json`、`tasks.jsonl`、`registry.json`，旧目录保留不动。
 2. `$DSH_HOME/supergroup/plugin.log` 会记录启动、单实例锁回收等事件。

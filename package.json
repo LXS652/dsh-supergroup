@@ -1,6 +1,6 @@
 {
   "name": "dsh-supergroup",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DSH 多会话编排插件：按会话 ID 派工、按 rpcId 回收结果、重启后自动对账自愈。",
   "type": "module",
   "license": "MIT",
