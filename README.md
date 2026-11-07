@@ -4,7 +4,7 @@ dsh-supergroup 是 DeepSeek Harness 的一组会话编排插件。它把一个�
 
 侧栏面板可以创建、改名、增删成员、解散整体；名单与工单账本都落盘，宿主重启后会在启动时自动对账，把「投递了但没等到结算」的工单按历史证据收敛，从不自动重发——因为外部副作用可能已经发生了。
 
-安装只需要往 DSH profile 里加一个 `insert` 条目，无外部依赖。
+安装方式见下方；v1.1 起推荐作为 profile 的 bundle 安装，无外部依赖。
 
 ## 能力
 
@@ -19,11 +19,34 @@ dsh-supergroup 是 DeepSeek Harness 的一组会话编排插件。它把一个�
 
 ## 安装
 
-当前版本有两条安装路径。**新装优先走路 A**：直接改 profile 的 patch 文件，不依赖 bundle 机制。
+v1.1 起推荐把本包作为 profile 的 bundle 安装。只有不装包、临时试用时，才走手写 `insert`。
 
-### 路 A（推荐，当前真实可用）
+### 路 A：作为包安装（推荐）
 
-1. 把本目录放到一个固定位置，确认入口文件存在：`<你的工作区>/dsh-supergroup/src/plugin2.mjs`。
+1. 在 DSH 宿主完全退出后，用绝对路径安装：
+
+   ```powershell
+   dsh plugin --profile <你的 profile> add "file:<绝对路径>/dsh-supergroup"
+   ```
+
+   等价做法：在 profile 目录执行 `pnpm add "file:<绝对路径>/dsh-supergroup"`。
+
+2. 从 1.1 起，必须同时满足以下两条，否则设置 → 插件列表不会显示，或标题退化成一整条 `file://` 路径：
+
+   - profile 的 `package.json` 的 `dependencies` 里有 `dsh-supergroup`；
+   - 同一个 `package.json` 的 `dsh.profile.bundles` 数组里有 `dsh-supergroup`。
+
+   `dsh plugin add` 在 1.1.0 实测会自动写入 bundles；若你的 DSH 版本没有写入，手工追加一项。
+
+3. 确认 `node_modules/dsh-supergroup` 存在；必要时在 profile 目录执行 `pnpm install`。
+
+4. 重启 DSH。设置 → 插件列表应出现「超级代理部署」，侧栏面板应能打开；`ms2_status` 应可用。
+
+5. 数据默认落在 `$DSH_HOME/supergroup`。从 1.0.x 升级时，首次启动会按文件冷迁移旧数据，旧目录保留不动。
+
+### 路 B：手写 insert（不装包，仅临时试用）
+
+1. 把本目录放到固定位置，确认入口文件存在：`<你的工作区>/dsh-supergroup/src/plugin2.mjs`。
 2. 打开 `~/.dsh/profiles/<profile>/cordis.patch.yml`，在**文件末尾追加**：
 
 ```yaml
@@ -31,33 +54,31 @@ dsh-supergroup 是 DeepSeek Harness 的一组会话编排插件。它把一个�
     - id: dsh-supergroup
       name: file:///<你的工作区>/dsh-supergroup/src/plugin2.mjs
       config:
-        registryFile: '<你的 DSH_HOME>\data\registry.json'
-        groupsFile: '<你的 DSH_HOME>\data\groups.json'
-        ledgerFile: '<你的 DSH_HOME>\data\tasks.jsonl'
+        registryFile: '<你的 DSH_HOME>\supergroup\registry.json'
+        groupsFile: '<你的 DSH_HOME>\supergroup\groups.json'
+        ledgerFile: '<你的 DSH_HOME>\supergroup\tasks.jsonl'
 ```
 
 3. 重启 DSH。侧栏应出现「超级代理部署」图标，`ms2_status` 应可用。
-4. `name` 必须是**绝对路径**的 `file:///` 形式，并指向**入口文件**；Windows 路径把反斜杠写成 `/`。`<profile>` 换成你的 profile 目录名。
+4. `name` 必须是**绝对路径**的 `file:///` 形式，并指向**入口文件**；Windows 路径把反斜杠写成 `/`。
 
-### 路 B：作为 bundle 安装
-
-bundle 方式要求以下三件事同时成立，缺一不会加载：
-
-1. profile 的 `package.json` 在 `dependencies` 里登记本包，例如 `"dsh-supergroup": "file:<你的工作区>/dsh-supergroup"`；
-2. 同一个 `package.json` 的 `dsh.profile.bundles` 数组包含 `"dsh-supergroup"`；
-3. 在 profile 目录执行 `pnpm install`（或你的 DSH 版本提供的等价安装步骤），让包真正进入 `node_modules`。
-
-三者齐备后，bundle 会读取包内的 `cordis.patch.yml`；其中 `name` 使用包名 `dsh-supergroup`，不是 `file://` 路径。
+> 这条路不会出现在设置 → 插件列表的“已安装插件”里，而且标题会显示整条 `file://` 路径。要可升级、可卸载、有可读标题，请走上面的包安装。
 
 ### 不要这样写
 
 - **不要用 `plugin:` 字段**。rc.5 的 patch 结构是 `{ id, insert?, name?, ...overrides }`，`plugin:` 不是入口字段。
 - **不要裸写 `- id: dsh-supergroup` 而不包在 `insert:` 里**。没有对应的已有条目时，它会被当成覆盖，宿主只记一条 `patch: entry ... not found` 然后静默跳过。
-- **路 A 的 `name` 不要指向目录**，必须指向入口文件 `src/plugin2.mjs`（`file:///` 形式）。
+- **路 B 的 `name` 不要指向目录**，必须指向入口文件 `src/plugin2.mjs`（`file:///` 形式）。
+
+### 从 1.0.x 升级到 1.1.0
+
+1. 数据目录迁到 `$DSH_HOME/supergroup`；首次启动按文件冷迁移 `groups.json`、`tasks.jsonl`、`registry.json`，旧目录保留不动。
+2. `$DSH_HOME/supergroup/plugin.log` 会记录启动、单实例锁回收等事件。
+3. 删除 profile 里旧的手写 insert 整块（从 `- insert:` 到该块结束），再按路 A 安装。
 
 ### 装完没反应怎么查
 
-1. 确认改的是当前 profile 的 `cordis.patch.yml`，且条目追加在文件末尾、位于 `insert:` 列表内。
+1. 包安装时，先确认 `dependencies` 与 `dsh.profile.bundles` 同时含 `dsh-supergroup`，且 `node_modules/dsh-supergroup` 存在。
 2. 用 `dsh --dump-config` 看最终配置。Desktop 的 profile 可能被 Electron 独占，先复制一份再对副本 dump：
 
    ```bash
@@ -65,8 +86,8 @@ bundle 方式要求以下三件事同时成立，缺一不会加载：
    ```
 
    然后按你的 DSH 版本支持的方式让 CLI 使用 `<profile>-probe`，执行 `dsh --dump-config 2> dump.err`。
-3. `grep dsh-supergroup` 检查 dump 输出；若 stderr 出现 `patch: entry ... not found`，说明条目没有进入 `insert:`，或 id 写错。
-4. 仍无图标时，再确认入口文件存在、`name` 是 `file:///` 文件 URL，并且 DSH 已完全重启（客户端 bundle 不热更）。
+3. `grep dsh-supergroup` 检查 dump 输出；若 stderr 出现 `patch: entry ... not found`，说明路 B 的条目没有进入 `insert:`，或 id 写错。
+4. 仍无图标时，确认入口文件存在；路 B 的 `name` 是 `file:///` 文件 URL；并且 DSH 已完全重启（客户端 bundle 不热更）。
 
 `groupsFile` 省略时会跟着 `registryFile` 走，落在同一目录的 `groups.json`；`eventsLogFile` 省略时落在账本同目录的 `session-events.log`。
 
