@@ -249,6 +249,12 @@ window.__ModuleLoader__.load({
                     typeof group.inFlight === 'number' && group.inFlight > 0
                         ? h('span', { style: { ...S.dim, color: 'var(--dsw-alias-color-warning, #c90)' } }, `在途 ${group.inFlight}`)
                         : null,
+                    typeof group.provisional === 'number' && group.provisional > 0
+                        ? h('span', {
+                            style: { ...S.dim, color: 'var(--dsw-alias-color-warning, #c90)' },
+                            title: '成员已上报完成，等对账或 turn/end 复核'
+                        }, `未核实 ${group.provisional}`)
+                        : null,
                     h('span', { style: { flex: 1 } }),
                     h('button', {
                         type: 'button',

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/plugin2.mjs';
 import { SessionRegistry } from '../src/core/registry.mjs';
+import { REPORT_HINT } from '../src/core/delivery.mjs';
 
 const LEAD = 'session-lead';
 const MEMBER = 'session-member-a';
@@ -164,7 +165,7 @@ test('主会话能派工，成员不能；参数校验与拒绝都可读', async
         assert.equal(host.calls.length, 1);
         assert.equal(host.calls[0].request.sessionId, MEMBER);
         assert.match(host.calls[0].request.requestId, /^ms-/);
-        assert.deepEqual(host.calls[0].request.content, [{ type: 'text', text: '整理今天的邮' }]);
+        assert.deepEqual(host.calls[0].request.content, [{ type: 'text', text: `整理今天的邮\n\n${REPORT_HINT}` }]);
         // 主会话必须直接从返回文本里拿requestId：它是后ms2_status/ms2_resolve 的唯一钥匙
         assert.match(ok.summary, /requestId=ms-/);
         assert.match(host.render('ms2_dispatch', ok), /requestId=ms-/);
@@ -211,6 +212,10 @@ test('权限面：跨会话通道只归主会话，名单外会话不受影响',
         // 成员不能直发/派工
         assert.match(String(ask('send_message', MEMBER)), /coordinator-only/);
         assert.match(String(ask('ms2_dispatch', MEMBER)), /MS2_MEMBER_DENIED/);
+        // 成员唯一豁免：精确匹配 ms2_report；前缀相似名仍被拒
+        assert.equal(ask('ms2_report', MEMBER), undefined);
+        assert.match(String(ask('ms2_report_v2', MEMBER)), /MS2_MEMBER_DENIED/);
+        assert.match(String(ask('ms2_status', MEMBER)), /MS2_MEMBER_DENIED/);
         // 成员的普通业务工具照
         assert.equal(ask('read_file', MEMBER), undefined);
         // 不在名单里的会话完全不受影响

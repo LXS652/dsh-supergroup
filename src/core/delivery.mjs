@@ -5,12 +5,16 @@
  * 其中 source.rpcId 就是我们传入的 requestId，因此归集不靠“猜测下一个回复”。
  */
 
+/** 派工正文末尾的固定提示；不是自由文本通道，只提醒成员有这个上报入口。 */
+export const REPORT_HINT = '（完成后调用 ms2_report 上报；status 与 summary 必填）';
+
 /** 一条投递请求；mode='steer' 打断当前轮，缺省则排队等待。 */
 export function buildPromptRequest({ sessionId, requestId, text, mode }) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('DELIVERY_INVALID_SESSION');
     if (typeof requestId !== 'string' || requestId.length === 0) throw new Error('DELIVERY_INVALID_REQUEST_ID');
     if (typeof text !== 'string' || text.trim().length === 0) throw new Error('DELIVERY_EMPTY_TEXT');
-    const request = { sessionId, requestId, content: [{ type: 'text', text }] };
+    const body = text.includes('ms2_report') ? text : `${text}\n\n${REPORT_HINT}`;
+    const request = { sessionId, requestId, content: [{ type: 'text', text: body }] };
     if (mode === 'steer') request.mode = 'steer';
     else if (mode !== undefined && mode !== 'queue') throw new Error('DELIVERY_INVALID_MODE');
     return request;

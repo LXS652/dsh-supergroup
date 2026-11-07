@@ -14,7 +14,7 @@ dsh-supergroup 是 DeepSeek Harness 的一组会话编排插件。它把一个�
 - **快速结算 + 拉取对账**：`session/event` 能收到的结果走快路径；收不到时，在启动、`ms2_status`、`/ms2 panel` 三个时机读取会话历史补结算。
 - **重启自愈**：启动时先恢复账本，再对 `delivered` / `uncertain` 工单做历史对账；有完整 `turn/end` 证据就收敛，没有就留给人裁决。
 - **侧栏面板**：会话按工作区分组；创建整体三步向导；整体卡片支持改名、成员增删、解散；空白会话可以选进整体。
-- **成员权限隔离**：成员不能调用 `ms2_*` 协调工具，也不能用跨会话工具；业务工具照常可用。主会话（lead）才拥有派工、裁决、改名、改成员、解散权限。
+- **成员权限隔离**：成员不能调用 `ms2_*` 协调工具（唯一例外是 `ms2_report`，只能上报自己名下的在途工单），也不能用跨会话工具；业务工具照常可用。主会话（lead）才拥有派工、裁决、改名、改成员、解散权限。
 - **绝不自动重发**：对账只读历史、只改状态，不会为了“催结果”再发一条消息。
 
 ## 安装
@@ -119,6 +119,7 @@ v1.1 起推荐把本包作为 profile 的 bundle 安装。只有不装包、临�
 | `ms2_members` | `{"group":"整体名或 id","request":"list\|add <id>\|remove <id>\|lead <id>"}` | 查看或增删成员 |
 | `ms2_dispatch` | `{"group":"整体名或 id","memberId":"session-...","text":"..."}` | 把一张工单投给成员 |
 | `ms2_resolve` | `{"requestId":"...","action":"accept\|fail"}` | 主会话裁决一条等待人工的工单 |
+| `ms2_report` | `{"status":"completed\|blocked\|failed","summary":"...","detail":{},"requestId":"可选"}` | 成员上报自己名下在途工单；completed 先标未核实，等对账/turn-end 复核 |
 
 ## 命令
 
@@ -141,13 +142,14 @@ v1.1 起推荐把本包作为 profile 的 bundle 安装。只有不装包、临�
 ## 结算与恢复
 
 1. `ms2_dispatch` 生成 `requestId`，消息进入成员会话，账本写 `dispatch`，工单进入 `delivered`。
-2. 结果回收有两条路：
+2. 成员可以调用 `ms2_report` 主动上报 `completed`：先记为 `completed` + `provisional: true`（未核实），账本写 `kind:"report"`；随后 `turn/end` 快路径或历史对账拿到完成证据，才升级为 `verified`。`blocked` 直接转人工，`failed` 直接失败。
+3. 结果回收有两条路：
    - `session/event` 快路径：收到带同一 `rpcId` 的 `user/message` 后，跟随该回合到 `turn/end`；
    - 历史对账：在启动、`ms2_status`、`/ms2 panel` 时读取会话历史，按 `rpcId` 精确锚定。
-3. 宿主重启时，`delivered` 会先变成 `uncertain`（不知道结果是否已经产生）。启动对账会继续查历史：
+4. 宿主重启时，`delivered` 会先变成 `uncertain`（不知道结果是否已经产生）。启动对账会继续查历史：
    - 找到 `turn/end` 且 `completed`：结算为 `completed`，保留 `reason: "restart"` 作为证据，`source` 标为 `history-reconcile-after-restart`；
    - 找不到证据：保持 `uncertain`，原因写进 `observeStats`。
-4. `uncertain` 也可以由主会话用 `ms2_resolve` 人工 `accept` / `fail`；能自动证明完成的才自动收敛。
+5. `uncertain` 也可以由主会话用 `ms2_resolve` 人工 `accept` / `fail`；能自动证明完成的才自动收敛。
 
 ## 已知边界
 

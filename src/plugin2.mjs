@@ -295,6 +295,8 @@ export function apply(ctx, config) {
     const STARTUP_RECONCILE_INTERVAL_MS = config && Number.isSafeInteger(config.startupReconcileIntervalMs)
         ? Math.min(Math.max(config.startupReconcileIntervalMs, 1), 200)
         : 200;
+    // 成员唯一可用的 ms2_* 工具；必须精确匹配，防止 ms2_report_v2 这类前缀绕过。
+    const MEMBER_REPORT_TOOL = 'ms2_report';
     const eventLog = {
         file: eventLogFile,
         bytes: 0,
@@ -429,7 +431,8 @@ export function apply(ctx, config) {
                 lead: snapshot.lead,
                 members: snapshot.members.map(member => ({ sessionId: member.sessionId, label: member.label, roleClass: member.roleClass })),
                 tasks: tasks.length,
-                inFlight: tasks.filter(task => task.state === 'delivered' || task.state === 'uncertain').length
+                inFlight: tasks.filter(task => task.state === 'delivered' || task.state === 'uncertain').length,
+                provisional: tasks.filter(task => task.state === 'completed' && task.provisional === true).length
             };
         });
     }
@@ -696,7 +699,8 @@ export function apply(ctx, config) {
             const coordinator = state.coordinators.get(group.id);
             if (coordinator === undefined) continue;
             for (const task of coordinator.tasks()) {
-                if (task.state !== 'delivered' && task.state !== 'uncertain') continue;
+                if (task.state !== 'delivered' && task.state !== 'uncertain'
+                    && !(task.state === 'completed' && task.provisional === true)) continue;
                 try {
                     const window = await readTaskHistory(controller, task);
                     const outcome = await coordinator.reconcileFromHistory(task.requestId, window.events);
@@ -808,6 +812,109 @@ export function apply(ctx, config) {
                     },
                     logTruncated: state.eventLog.truncated === true
                 });
+            }
+        },
+        {
+            definition: toolDefinition(
+                'ms2_report',
+                '执行会话上报自己名下、当前在途工单的结果。status 必填（completed/blocked/failed），summary 必填；requestId 只用于同会话多单消歧。',
+                '{"status":"completed","summary":"做了什么、证据","detail":{},"requestId":"可选"}'
+            ),
+            async execute(args, exec) {
+                const failed = await readyError();
+                if (failed !== null) return reply('error', failed.summary, { code: 'REPORT_NOT_READY' });
+                const caller = exec && exec.agent && exec.agent.id;
+                if (typeof caller !== 'string' || caller.length === 0) {
+                    return reply('error', 'REPORT_NOT_MEMBER: 无法识别调用会话', { code: 'REPORT_NOT_MEMBER' });
+                }
+                let payload;
+                try {
+                    payload = parseJson(args && args.request, '{"status":"completed","summary":"...","detail":{},"requestId":"可选"}');
+                } catch (error) {
+                    return reply('error', error instanceof Error ? error.message : String(error), { code: 'REPORT_BAD_ARGUMENT' });
+                }
+                if (!['completed', 'blocked', 'failed'].includes(payload.status)) {
+                    return reply('error', 'REPORT_BAD_ARGUMENT: status 只能是 completed / blocked / failed', { code: 'REPORT_BAD_ARGUMENT' });
+                }
+                const summary = typeof payload.summary === 'string'
+                    ? payload.summary.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
+                    : '';
+                const summaryLength = [...summary].length;
+                if (summaryLength === 0 || summaryLength > 2000) {
+                    return reply('error', 'REPORT_BAD_ARGUMENT: summary 必须是 1–2000 个字符', { code: 'REPORT_BAD_ARGUMENT' });
+                }
+                const detail = payload.detail === undefined ? null : payload.detail;
+                let detailJson;
+                try {
+                    detailJson = JSON.stringify(detail);
+                } catch {
+                    return reply('error', 'REPORT_BAD_ARGUMENT: detail 必须是可序列化的 JSON 值', { code: 'REPORT_BAD_ARGUMENT' });
+                }
+                if (typeof detailJson !== 'string' || Buffer.byteLength(detailJson, 'utf8') > 8 * 1024) {
+                    return reply('error', 'REPORT_BAD_ARGUMENT: detail 序列化后不能超过 8KB', { code: 'REPORT_BAD_ARGUMENT' });
+                }
+                let requestId = null;
+                if (payload.requestId !== undefined) {
+                    if (typeof payload.requestId !== 'string' || payload.requestId.length === 0) {
+                        return reply('error', 'REPORT_BAD_ARGUMENT: requestId 必须是非空字符串', { code: 'REPORT_BAD_ARGUMENT' });
+                    }
+                    requestId = payload.requestId;
+                }
+
+                const memberships = groupsFor(caller);
+                if (memberships.length === 0) {
+                    return reply('error', 'REPORT_NOT_MEMBER: 不在任何整体内', { code: 'REPORT_NOT_MEMBER' });
+                }
+                // 候选集始终先按 sessionId === caller 过滤；requestId 只负责在“自己的单”里消歧。
+                const entries = [];
+                for (const group of memberships) {
+                    const coordinator = state.coordinators.get(group.id);
+                    if (coordinator === undefined) continue;
+                    for (const task of coordinator.tasks()) {
+                        if (task.sessionId !== caller) continue;
+                        if (task.state === 'delivered' || task.state === 'uncertain'
+                            || (task.state === 'completed' && task.provisional === true)) {
+                            entries.push({ group, coordinator, task });
+                        }
+                    }
+                }
+                let chosen;
+                if (requestId !== null) {
+                    chosen = entries.find(entry => entry.task.requestId === requestId);
+                    if (chosen === undefined) {
+                        return reply('error', 'REPORT_NO_TASK: 你名下没有这张工单', { code: 'REPORT_NO_TASK' });
+                    }
+                } else {
+                    const inFlight = entries.filter(entry => entry.task.state === 'delivered' || entry.task.state === 'uncertain');
+                    if (inFlight.length > 1) {
+                        return reply('error', `REPORT_AMBIGUOUS: 你有 ${inFlight.length} 条在途工单`, {
+                            code: 'REPORT_AMBIGUOUS',
+                            requestIds: inFlight.map(entry => entry.task.requestId)
+                        });
+                    }
+                    if (inFlight.length === 0 && entries.length !== 1) {
+                        return reply('error', 'REPORT_NO_TASK: 你名下没有在途工单', { code: 'REPORT_NO_TASK' });
+                    }
+                    chosen = inFlight[0] ?? entries[0];
+                }
+                try {
+                    const outcome = await chosen.coordinator.report(caller, {
+                        status: payload.status,
+                        summary,
+                        detail,
+                        requestId: requestId === null ? undefined : requestId
+                    });
+                    return reply('ok', `${payload.status} → ${outcome.taskState}${outcome.duplicate ? '（重复上报）' : ''}（${chosen.group.name}）`, {
+                        ...outcome,
+                        group: chosen.group.name
+                    });
+                } catch (error) {
+                    const code = error && typeof error.code === 'string' ? error.code : 'REPORT_LEDGER_FAILED';
+                    return reply('error', error instanceof Error ? error.message : String(error), {
+                        code,
+                        ...(error && error.data && typeof error.data === 'object' ? error.data : {})
+                    });
+                }
             }
         },
         {
@@ -1143,7 +1250,7 @@ export function apply(ctx, config) {
             // 按当前名单现算，不查可能过期的缓存：成员被移除后必须立刻恢复普通权限。
             const memberships = groups.filter(group => group.registry.get(caller) !== undefined);
             if (memberships.length === 0) return;
-            if (typeof exec.name === 'string' && exec.name.startsWith('ms2_')) {
+            if (typeof exec.name === 'string' && exec.name.startsWith('ms2_') && exec.name !== MEMBER_REPORT_TOOL) {
                 return 'MS2_MEMBER_DENIED: 成员不能直接使用协调体工具，请经主会话';
             }
             for (const group of memberships) {

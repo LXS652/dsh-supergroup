@@ -6,7 +6,7 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const KINDS = new Set(['dispatch', 'settled', 'human', 'resolve', 'uncertain', 'adopt']);
+const KINDS = new Set(['dispatch', 'settled', 'report', 'human', 'resolve', 'uncertain', 'adopt']);
 
 /** 极简账本：内存里也留一份，便于没有文件时做测试。 */
 export class TaskLedger {
@@ -86,6 +86,9 @@ export function rebuildTasks(events) {
                 turn: null,
                 result: '',
                 source: null,
+                provisional: false,
+                verified: false,
+                reportKey: null,
                 idempotent: event.idempotent === true
             });
             continue;
@@ -105,19 +108,40 @@ export function rebuildTasks(events) {
             if (typeof event.groupId === 'string') task.groupId = event.groupId;
             continue;
         }
+        if (event.kind === 'report') {
+            // 已核实结论不能被旧上报覆盖；正常顺序里 report 先于 settled，
+            // 重放时会自然被后面的 settled 盖掉。
+            if (task.verified === true) continue;
+            const status = event.status === 'blocked' ? 'needs_human' : (event.status === 'failed' ? 'failed' : 'completed');
+            task.state = status;
+            task.provisional = status === 'completed';
+            task.verified = false;
+            task.source = typeof event.source === 'string' ? event.source : 'member-report';
+            task.result = typeof event.summary === 'string' ? event.summary : '';
+            if (Number.isSafeInteger(event.turn)) task.turn = event.turn;
+            task.reportKey = typeof event.reportKey === 'string' ? event.reportKey : null;
+            task.reportDetail = event.detail === undefined ? null : event.detail;
+            if (status === 'needs_human') task.reason = 'member_blocked';
+            else if (status === 'failed') task.reason = 'member_failed';
+            continue;
+        }
         if (event.kind === 'settled') {
             task.state = event.state === undefined ? 'completed' : event.state;
             task.turn = event.turn === undefined ? null : event.turn;
             task.result = typeof event.result === 'string' ? event.result : '';
             task.reason = event.reason === undefined ? null : event.reason;
             task.source = typeof event.source === 'string' ? event.source : null;
+            task.provisional = false;
+            task.verified = true;
             if (typeof event.priorReason === 'string') task.priorReason = event.priorReason;
             if (typeof event.settlementReason === 'string') task.settlementReason = event.settlementReason;
+            if (typeof event.supersededBy === 'string') task.supersededBy = event.supersededBy;
             continue;
         }
         if (event.kind === 'human') {
             task.state = 'needs_human';
             task.reason = 'human_interrupt';
+            task.provisional = false;
             task.humanInterventions = task.humanInterventions === undefined ? [] : task.humanInterventions;
             if (event.evidence !== undefined) task.humanInterventions.push(event.evidence);
             continue;
@@ -125,6 +149,7 @@ export function rebuildTasks(events) {
         if (event.kind === 'resolve') {
             task.state = event.state;
             task.reason = event.reason === undefined ? 'human' : event.reason;
+            task.provisional = false;
             task.resolvedBy = 'human';
             task.resolvedAt = event.at;
         }

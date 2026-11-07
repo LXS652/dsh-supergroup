@@ -1,7 +1,7 @@
 /** 投递与归集单测：请求形状、幂等、错误映射、按 rpcId 找回结果。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DeliveryChannel, buildPromptRequest, locateResult, ResultTracker, visibleText } from '../src/core/delivery.mjs';
+import { DeliveryChannel, REPORT_HINT, buildPromptRequest, locateResult, ResultTracker, visibleText } from '../src/core/delivery.mjs';
 
 /** 造一条最简 session/event。 */
 function event(type, data) {
@@ -10,7 +10,7 @@ function event(type, data) {
 
 test('请求形状：排队不带 mode，steer 才带，空文本拒绝', () => {
     const queued = buildPromptRequest({ sessionId: 's1', requestId: 'r1', text: 'hi' });
-    assert.deepEqual(queued, { sessionId: 's1', requestId: 'r1', content: [{ type: 'text', text: 'hi' }] });
+    assert.deepEqual(queued, { sessionId: 's1', requestId: 'r1', content: [{ type: 'text', text: `hi\n\n${REPORT_HINT}` }] });
     const steered = buildPromptRequest({ sessionId: 's1', requestId: 'r2', text: 'ho', mode: 'steer' });
     assert.equal(steered.mode, 'steer');
     assert.throws(() => buildPromptRequest({ sessionId: 's1', requestId: 'r3', text: '   ' }), /EMPTY_TEXT/);

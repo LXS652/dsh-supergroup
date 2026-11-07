@@ -3,8 +3,25 @@
  * 只做“按会话寻址”的协调——不依赖原生 Team，也不要求子会话装本插件。
  * 可选的账本让它能跨重启回答“上次退出时哪些工单还没结算”。
  */
+import { createHash } from 'node:crypto';
+
 import { locateResult } from './delivery.mjs';
 import { rebuildTasks } from './ledger.mjs';
+
+const REPORT_STATUSES = new Set(['completed', 'blocked', 'failed']);
+
+function reportFailure(code, message, data = {}) {
+    const error = new Error(`${code}: ${message}`);
+    error.code = code;
+    error.data = data;
+    return error;
+}
+
+function reportKeyOf(caller, requestId, turn, status, summary, detailJson) {
+    return createHash('sha256')
+        .update([caller, requestId, String(turn), status, summary, detailJson].join('|'), 'utf8')
+        .digest('hex');
+}
 
 export class Coordinator {
     #registry;
@@ -19,6 +36,8 @@ export class Coordinator {
     // 本协调器已经发出 prompt、但 dispatch 还没返回的 id。解散整体时用它
     // 挡住“消息可能已发出、任务行还没落”的窗口。
     #dispatching = new Set();
+    // 上报按到达顺序串行处理：同一条单的重复/冲突判断不能并发穿透。
+    #reportQueue = Promise.resolve();
     // 正在 prompt 往返中的 requestId 由 DeliveryChannel 统一登记（#inflight）。
     // 这里不能只记在本协调器上：同一会话可能同时属于 A、B 两个整体，
     // B 的协调器必须也能认出 A 正在投递的 id。
@@ -49,10 +68,13 @@ export class Coordinator {
         task.state = item.state;
         task.turn = item.turn;
         task.result = item.text;
+        task.provisional = false;
+        task.verified = true;
         if (item.reason !== undefined) task.reason = item.reason;
         if (item.source !== undefined) task.source = item.source;
         if (item.priorReason !== undefined) task.priorReason = item.priorReason;
         if (item.settlementReason !== undefined) task.settlementReason = item.settlementReason;
+        if (item.supersededBy !== undefined) task.supersededBy = item.supersededBy;
         this.#record({
             kind: 'settled',
             requestId: item.requestId,
@@ -62,7 +84,8 @@ export class Coordinator {
             reason: item.reason,
             ...item.source === undefined ? {} : { source: item.source },
             ...item.priorReason === undefined ? {} : { priorReason: item.priorReason },
-            ...item.settlementReason === undefined ? {} : { settlementReason: item.settlementReason }
+            ...item.settlementReason === undefined ? {} : { settlementReason: item.settlementReason },
+            ...item.supersededBy === undefined ? {} : { supersededBy: item.supersededBy }
         });
     }
 
@@ -201,6 +224,131 @@ export class Coordinator {
         return { ...task, duplicate: false };
     }
 
+    /**
+     * 成员自报：只处理 caller 自己名下的单。
+     * - requestId 只是把歧义收敛到“自己的单”，过滤条件里恒有 sessionId === caller；
+     * - completed 先标 provisional，等事件/对账复核；blocked/failed 直接进人工态/失败态；
+     * - 同一 reportKey 幂等，不同 key 的二次上报冲突，不覆盖已核实结论。
+     */
+    report(caller, input = {}) {
+        const run = this.#reportQueue.then(() => this.#reportNow(caller, input));
+        this.#reportQueue = run.catch(() => {});
+        return run;
+    }
+
+    async #reportNow(caller, input) {
+        if (typeof caller !== 'string' || caller.length === 0) {
+            throw reportFailure('REPORT_BAD_ARGUMENT', '无法识别调用会话');
+        }
+        const status = input && input.status;
+        if (!REPORT_STATUSES.has(status)) {
+            throw reportFailure('REPORT_BAD_ARGUMENT', 'status 只能是 completed / blocked / failed');
+        }
+        const rawSummary = typeof input.summary === 'string' ? input.summary : '';
+        const summary = rawSummary.replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+        const summaryLength = [...summary].length;
+        if (summaryLength === 0 || summaryLength > 2000) {
+            throw reportFailure('REPORT_BAD_ARGUMENT', 'summary 必须是 1–2000 个字符');
+        }
+        const detail = input.detail === undefined ? null : input.detail;
+        let detailJson;
+        try {
+            detailJson = JSON.stringify(detail);
+        } catch {
+            throw reportFailure('REPORT_BAD_ARGUMENT', 'detail 必须是可序列化的 JSON 值');
+        }
+        if (typeof detailJson !== 'string' || Buffer.byteLength(detailJson, 'utf8') > 8 * 1024) {
+            throw reportFailure('REPORT_BAD_ARGUMENT', 'detail 序列化后不能超过 8KB');
+        }
+        let requestId = null;
+        if (input.requestId !== undefined) {
+            if (typeof input.requestId !== 'string' || input.requestId.length === 0) {
+                throw reportFailure('REPORT_BAD_ARGUMENT', 'requestId 必须是非空字符串');
+            }
+            requestId = input.requestId;
+        }
+
+        // 身份过滤恒在：不管模型传什么 requestId，都只能落到自己会话名下的单。
+        const own = [...this.#tasks.values()].filter(task => task.sessionId === caller);
+        let target;
+        if (requestId !== null) {
+            target = own.find(task => task.requestId === requestId);
+            if (target === undefined) throw reportFailure('REPORT_NO_TASK', '你名下没有这张工单');
+        } else {
+            const candidates = own.filter(task =>
+                task.state === 'delivered'
+                || task.state === 'uncertain'
+                || (task.state === 'completed' && task.provisional === true));
+            if (candidates.length === 0) throw reportFailure('REPORT_NO_TASK', '你名下没有在途工单');
+            if (candidates.length > 1) {
+                throw reportFailure('REPORT_AMBIGUOUS', `你有 ${candidates.length} 条在途工单，请带 requestId`, {
+                    requestIds: candidates.map(task => task.requestId)
+                });
+            }
+            target = candidates[0];
+        }
+
+        const turn = Number.isSafeInteger(target.turn) ? target.turn : null;
+        const key = reportKeyOf(caller, target.requestId, turn, status, summary, detailJson);
+        if (target.verified === true) {
+            throw reportFailure('REPORT_CONFLICT', '这张工单已经有已核实的结论，不能再用上报覆盖');
+        }
+        if (target.reportKey === key) {
+            return {
+                requestId: target.requestId,
+                taskState: target.state,
+                source: target.source,
+                provisional: target.provisional === true,
+                turn,
+                duplicate: true
+            };
+        }
+        if (target.state !== 'delivered' && target.state !== 'uncertain') {
+            if (target.state === 'needs_human') {
+                throw reportFailure('REPORT_TASK_STATE', '这张工单在等待人工裁决，请先让主会话 ms2_resolve');
+            }
+            throw reportFailure('REPORT_CONFLICT', '这张工单已经处于终态，不能重复上报');
+        }
+
+        const source = target.state === 'uncertain' ? 'member-report-after-restart' : 'member-report';
+        const event = {
+            kind: 'report',
+            requestId: target.requestId,
+            sessionId: caller,
+            status,
+            summary,
+            detail,
+            turn,
+            source,
+            reportKey: key
+        };
+        if (this.#ledger !== null) {
+            try {
+                await this.#ledger.append({ groupId: this.groupId, ...event });
+            } catch {
+                throw reportFailure('REPORT_LEDGER_FAILED', '上报写入账本失败，内存状态未改，可重试');
+            }
+        }
+        target.state = status === 'completed' ? 'completed' : (status === 'blocked' ? 'needs_human' : 'failed');
+        target.provisional = status === 'completed';
+        target.verified = false;
+        target.source = source;
+        target.result = summary;
+        target.turn = turn;
+        target.reportKey = key;
+        target.reportDetail = detail;
+        if (status === 'blocked') target.reason = 'member_blocked';
+        else if (status === 'failed') target.reason = 'member_failed';
+        return {
+            requestId: target.requestId,
+            taskState: target.state,
+            source,
+            provisional: target.provisional,
+            turn,
+            duplicate: false
+        };
+    }
+
     /** 消费一条会话事件；返回本次结算到的工单。 */
     observe(sessionId, event) {
         if (!event || typeof event !== 'object' || !event.data) return [];
@@ -267,7 +415,8 @@ export class Coordinator {
         const task = this.#tasks.get(requestId);
         if (task === undefined) return { state: 'unknown', requestId };
         const uncertain = task.state === 'uncertain';
-        if (task.state !== 'delivered' && !uncertain) return { state: 'skipped', requestId, taskState: task.state };
+        const provisional = task.state === 'completed' && task.provisional === true;
+        if (task.state !== 'delivered' && !uncertain && !provisional) return { state: 'skipped', requestId, taskState: task.state };
         const located = locateResult(events, requestId);
         if (located.state === 'pending') return { ...located, requestId, taskState: task.state };
         if (located.state === 'missing') return { state: 'missing', requestId, taskState: task.state };
@@ -277,7 +426,10 @@ export class Coordinator {
             return { state: 'unconfirmed', requestId, taskState: task.state, turn: located.turn, reason: located.state };
         }
         // 历史读取是异步的；读回来时事件快路径可能已经结算完了，必须再判一次。
-        if (task.state !== 'delivered' && task.state !== 'uncertain') return { state: 'skipped', requestId, taskState: task.state };
+        if (task.state !== 'delivered' && task.state !== 'uncertain'
+            && !(task.state === 'completed' && task.provisional === true)) {
+            return { state: 'skipped', requestId, taskState: task.state };
+        }
         if (uncertain) {
             const priorReason = task.reason;
             this.#settleTask(task, {
@@ -298,7 +450,9 @@ export class Coordinator {
                 turn: located.turn,
                 text: located.text,
                 reason: located.reason,
-                source: 'history-reconcile'
+                source: 'history-reconcile',
+                // 上报说 completed、历史证明 failed：对账赢，并保留被推翻的来源。
+                ...(provisional && located.state === 'failed' ? { supersededBy: 'history-reconcile' } : {})
             });
         }
         this.#tracker.forget(requestId);
