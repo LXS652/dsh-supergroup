@@ -192,3 +192,94 @@ test('跨整体并发：A 还在 prompt 往返时，B 也不能把 A 的消息�
     assert.equal(coordinatorB.tasks()[0].state, 'delivered', '在途兄弟工单不能被当成人插话');
     assert.equal(channel.known('r-a-live'), true, '投递完成后 id 应进入已发集合');
 });
+
+test('共享 tracker：第一个整体只跳过，第二整体作为属主才结算', async () => {
+    const member = 'session-member-a';
+    const registryA = new SessionRegistry({ lead: 'session-lead-a', members: [{ sessionId: member }] });
+    const registryB = new SessionRegistry({ lead: 'session-lead-b', members: [{ sessionId: member }] });
+    const channel = new DeliveryChannel({ prompt: async () => ({ accepted: true }) });
+    const tracker = new ResultTracker();
+    const ledger = new TaskLedger();
+    const coordinatorA = new Coordinator({ registry: registryA, channel, tracker, ledger, groupId: 'g-a' });
+    const coordinatorB = new Coordinator({ registry: registryB, channel, tracker, ledger, groupId: 'g-b' });
+
+    await coordinatorB.dispatch(member, 'B 的工单', { requestId: 'r-owner' });
+    const events = [
+        { type: 'user/message', data: { turn: 5, source: { kind: 'user', rpcId: 'r-owner' } } },
+        { type: 'turn/start', data: { turn: 5 } },
+        { type: 'assistant/message', data: { turn: 5, message: { content: [{ type: 'text', text: 'B 做完了' }] } } },
+        { type: 'turn/end', data: { turn: 5, reason: 'completed' } }
+    ];
+
+    // 插件按 state.coordinators 插入顺序分发：A 先看到同一条事件。
+    for (const event of events) coordinatorA.observe(member, event);
+    assert.equal(coordinatorA.tasks().length, 0, '非属主不该留下任务，也不该吞掉共享 tracker 的条目');
+    assert.equal(coordinatorB.tasks()[0].state, 'delivered', 'A 跳过之后，属主仍应有机会结算');
+
+    for (const event of events) coordinatorB.observe(member, event);
+    const [task] = coordinatorB.tasks();
+    assert.equal(task.state, 'completed');
+    assert.equal(task.turn, 5);
+    assert.equal(task.result, 'B 做完了');
+    await coordinatorB.flush();
+
+    const settled = (await ledger.load()).filter(event => event.kind === 'settled');
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0].groupId, 'g-b');
+    assert.equal(settled[0].requestId, 'r-owner');
+});
+
+test('共享 tracker：属主还在 prompt 往返、任务尚未落账时也能结算', async () => {
+    const member = 'session-member-a';
+    let coordinatorA;
+    let coordinatorB;
+    const channel = new DeliveryChannel({
+        prompt: async () => {
+            const events = [
+                { type: 'user/message', data: { turn: 6, source: { kind: 'user', rpcId: 'r-live-owner' } } },
+                { type: 'turn/start', data: { turn: 6 } },
+                { type: 'assistant/message', data: { turn: 6, message: { content: [{ type: 'text', text: '在途也能回' }] } } },
+                { type: 'turn/end', data: { turn: 6, reason: 'completed' } }
+            ];
+            for (const event of events) coordinatorA.observe(member, event);
+            for (const event of events) coordinatorB.observe(member, event);
+            return { accepted: true };
+        }
+    });
+    const registryA = new SessionRegistry({ lead: 'session-lead-a', members: [{ sessionId: member }] });
+    const registryB = new SessionRegistry({ lead: 'session-lead-b', members: [{ sessionId: member }] });
+    const tracker = new ResultTracker();
+    const ledger = new TaskLedger();
+    coordinatorA = new Coordinator({ registry: registryA, channel, tracker, ledger, groupId: 'g-a' });
+    coordinatorB = new Coordinator({ registry: registryB, channel, tracker, ledger, groupId: 'g-b' });
+
+    const task = await coordinatorB.dispatch(member, 'B 的工单', { requestId: 'r-live-owner' });
+    assert.equal(task.state, 'completed');
+    assert.equal(task.turn, 6);
+    assert.equal(task.result, '在途也能回');
+    assert.equal(coordinatorA.tasks().length, 0);
+});
+
+test('账本写失败：writeErrors 留下最近错误而不是静默吞掉', async () => {
+    const registry = new SessionRegistry({ lead: 'session-lead-a', members: [{ sessionId: 'session-member-a' }] });
+    const channel = new DeliveryChannel({ prompt: async () => ({ accepted: true }) });
+    const ledger = {
+        append: async () => { throw new Error('disk full'); },
+        load: async () => []
+    };
+    const coordinator = new Coordinator({
+        registry,
+        channel,
+        tracker: new ResultTracker(),
+        ledger,
+        groupId: 'g-a'
+    });
+
+    await coordinator.dispatch('session-member-a', '写不进去', { requestId: 'r-write-fail' });
+    await coordinator.flush();
+    const errors = coordinator.writeErrors();
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].kind, 'dispatch');
+    assert.equal(errors[0].requestId, 'r-write-fail');
+    assert.match(errors[0].message, /disk full/);
+});

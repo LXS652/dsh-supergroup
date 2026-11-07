@@ -30,10 +30,16 @@ async function waitFor(predicate, timeoutMs = 3000) {
 }
 
 /** 造一份落盘名'+ 假宿主；返回注册表、宿主句柄与已注册工具'*/
-async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, controllerDelay = 0, startupReconcileAttempts, startupReconcileIntervalMs } = {}) {
+async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, controllerDelay = 0, startupReconcileAttempts, startupReconcileIntervalMs, breakLedger = false } = {}) {
     const directory = await mkdtemp(join(tmpdir(), 'ms2-host-'));
     const file = join(directory, 'registry.json');
-    const ledgerFile = join(directory, 'tasks.jsonl');
+    let ledgerFile = join(directory, 'tasks.jsonl');
+    if (breakLedger) {
+        // 用“父路径是普通文件”稳定制造落盘失败，不依赖平台权限或盘符。
+        const blocker = join(directory, 'blocked');
+        await writeFile(blocker, 'not a directory', 'utf8');
+        ledgerFile = join(blocker, 'tasks.jsonl');
+    }
     const registry = new SessionRegistry({ lead: LEAD, members: [{ sessionId: MEMBER, roleClass: 'assistant' }] }, { file });
     await registry.save();
     if (Array.isArray(ledgerRecords) && ledgerRecords.length > 0) {
@@ -978,6 +984,28 @@ test('整体改成员：被移除成员还有在途工单时拒绝并报 request
         assert.match(rejected.text, new RegExp(requestId));
         const saved = JSON.parse(await readFile(join(host.directory, 'groups.json'), 'utf8'));
         assert.ok(saved.groups.find(group => group.id === groupId).members.some(member => member.sessionId === MEMBER), '拒绝时名单不能变');
+    } finally {
+        await host.cleanup();
+    }
+});
+
+test('ms2_status exposes ledger write failures', async () => {
+    const host = await makeHost({ breakLedger: true });
+    try {
+        const dispatched = await host.call('ms2_dispatch', {
+            request: JSON.stringify({ memberId: MEMBER, text: 'ledger failure probe' })
+        }, LEAD);
+        assert.equal(dispatched.status, 'ok');
+
+        let data;
+        await waitFor(async () => {
+            const status = await host.call('ms2_status', { request: '' }, LEAD);
+            assert.equal(status.status, 'ok');
+            data = JSON.parse(status.data);
+            return Array.isArray(data.writeErrors) && data.writeErrors.length > 0;
+        });
+        assert.ok(data.writeErrors.some(item => item.kind === 'dispatch'), 'dispatch write failure must be visible');
+        assert.equal(data.writeErrors[0].groupId, data.groups[0].id);
     } finally {
         await host.cleanup();
     }

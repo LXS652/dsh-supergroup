@@ -186,13 +186,23 @@ export class ResultTracker {
         return this.#pending.delete(requestId);
     }
 
-    /** 消费一个事件；返回本次被结算的结果列表（可能为空）。 */
-    observe(sessionId, event) {
+    /**
+     * 消费一个事件；返回本次被结算的结果列表（可能为空）。
+     *
+     * `owns(requestId)` 是可选的归属判定：多个 Coordinator 共享同一个 tracker 时，
+     * 非属主必须“跳过”而不是消费。否则先遍历到的整体会删掉 pending 条目，
+     * 真正的属主再也拿不到结算（见 docs/RPCID-ANCHOR-BUG.md）。
+     * 不传 `owns` 时保持旧行为。
+     */
+    observe(sessionId, event, { owns } = {}) {
         const settled = [];
         if (!event || typeof event !== 'object' || !event.data) return settled;
+        const owner = typeof owns === 'function' ? owns : null;
         const turn = Number.isSafeInteger(event.data.turn) ? event.data.turn : null;
         for (const [requestId, entry] of this.#pending) {
             if (entry.settled || entry.sessionId !== sessionId) continue;
+            // 非属主整体只读经过，不能锚定、不能删除、不能把结果塞进自己的兜底队列。
+            if (owner !== null && !owner(requestId)) continue;
             // 先认领“由本次投递产生的那条用户消息”，再绑定它的回合；
             // 这样即使子会话当时正在跑别的回合，也不会把别人的输出当成我们的结果。
             if (event.type === 'user/message' && event.data.source && event.data.source.rpcId === requestId) {

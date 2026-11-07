@@ -90,3 +90,32 @@
 - **E 成员权限回归**：成员调 `ms2_status` 仍返回 `MS2_MEMBER_DENIED`；业务工具不受影响。
 
 重启后先看 `plugin.log` 的 `startup` 行确认 `dataDir` 是 `%DSH_HOME%\supergroup`，再看 `tasks.jsonl` 的 `report` 行与 `ms2_status` 的 `provisional` / `verified` 字段。
+
+## 7. v3.1 修复：只让属主 Coordinator 结算
+
+### 根因
+
+`docs/RPCID-ANCHOR-BUG.md` 的结论成立：所有整体共享一个 `ResultTracker`，`handleSessionEvent` 又按 `groups` 顺序把同一条事件喂给每个 Coordinator。非属主整体先调用 `tracker.observe()` 时把 pending 条目消费并删除，但自己的 `#tasks` 没有这张单，只能塞进 `#earlySettled`；而 `#earlySettled` 只在同一 `requestId` 再次 dispatch 时冲刷，工单只派一次，于是永不补写。真正的属主再来时，tracker 条目已经没了。
+
+### 改动
+
+- `src/core/delivery.mjs`：`ResultTracker.observe(sessionId, event, { owns })` 增加归属判定。`owns(requestId) === false` 时直接 `continue`，不锚定、不删除、不返回结算。不传 `owns` 时保持旧行为。
+- `src/core/coordinator.mjs`：`observe()` 传入 `owns: id => this.#tasks.has(id) || this.#dispatching.has(id)`；`#dispatching` 覆盖“prompt 已发出、任务行尚未落账”的窗口。保留 `#earlySettled`，但注释明确它是兜底，不是主路径。
+- `src/core/coordinator.mjs`：`#record()` 的 `.catch(() => {})` 改为写入 `#writeErrors`（最近 20 条，含 at/kind/requestId/code/message）；新增 `writeErrors()` 快照方法。
+- `src/plugin2.mjs`：`ms2_status` 的 data 增加 `writeErrors`，按可见整体聚合后取最近 20 条，并带 `groupId`。
+- 测试：`tests/coordinator.test.mjs` 新增 3 条；`tests/plugin2.test.mjs` 新增 1 条（`makeHost({ breakLedger: true })`）。
+
+### 回归证据
+
+- `共享 tracker：第一个整体只跳过，第二整体作为属主才结算`：A、B 共享 tracker 与账本，派单给 B；A 先消费同一组 `user/message + turn/start + assistant/message + turn/end`，断言 `coordinatorA.tasks().length === 0`、B 仍为 `delivered`；B 再消费后断言 `state === 'completed'`、`turn === 5`、`result === 'B 做完了'`，账本只有一条 `settled` 且 `groupId === 'g-b'`。
+- `共享 tracker：属主还在 prompt 往返、任务尚未落账时也能结算`：B 的 prompt 回调内同步推完整轮事件，A 先跳过、B 靠 `#dispatching` 认领；`dispatch()` 返回的任务直接是 `completed`、`turn === 6`。
+- `账本写失败：writeErrors 留下最近错误而不是静默吞掉`：注入必失败的 ledger，`dispatch` 后 `writeErrors()` 有 `kind:'dispatch'`、`requestId` 与 `disk full` 原文。
+- `ms2_status exposes ledger write failures`：用“父路径是普通文件”制造真实落盘失败，轮询 `ms2_status` 直到 data 里出现该错误，并断言带 `groupId`。
+
+### 测试结果
+
+全套 **162 tests / 162 pass / 0 fail**（v3.1 前 158；新增 4 条）。
+
+### 复核说明
+
+`RPCID-ANCHOR-BUG.md` 的结论与推荐方向（归属判定）成立；文中 `plugin2.mjs:354/1110` 等行号随 v3 代码增长已有偏移，不影响语义。本次未修改该文档结论。真实“第二整体走事件快路径”仍需重启后观察：向第二整体派一张已完成单，`tasks.jsonl` 应在 `turn/end` 后出现无 `source` 的 `settled`，而不是等 `history-reconcile`。

@@ -32,6 +32,7 @@ export class Coordinator {
     #tasks = new Map();
     // 归集登记早于投递，宿主可能在 dispatch 返回前就把整轮事件推完；
     // 这时任务行还没建好，先把结算结果暂存，等 dispatch 落账后再补写。
+    // 这是兜底，不是主路径：正常路径应由属主整体在 tracker 里消费并立刻 #settleTask。
     #earlySettled = new Map();
     // 本协调器已经发出 prompt、但 dispatch 还没返回的 id。解散整体时用它
     // 挡住“消息可能已发出、任务行还没落”的窗口。
@@ -55,10 +56,23 @@ export class Coordinator {
         this.groupId = typeof groupId === 'string' ? groupId : null;
     }
 
-    /** 记账失败不影响主流程，但绝不静默吞掉业务结果。 */
+    // 记账失败不影响主流程，但绝不静默吞掉业务结果。
+    #writeErrors = [];
     #record(event) {
         if (this.#ledger === null) return;
-        const write = this.#ledger.append({ groupId: this.groupId, ...event }).catch(() => {});
+        const write = this.#ledger.append({ groupId: this.groupId, ...event }).catch(error => {
+            // 只保留最近 20 条，避免长期写失败把内存撑大。
+            this.#writeErrors.push({
+                at: new Date().toISOString(),
+                kind: event.kind,
+                requestId: event.requestId === undefined ? null : event.requestId,
+                code: error && typeof error.code === 'string' ? error.code : null,
+                message: error instanceof Error ? error.message : String(error)
+            });
+            if (this.#writeErrors.length > 20) {
+                this.#writeErrors.splice(0, this.#writeErrors.length - 20);
+            }
+        });
         this.#writes.add(write);
         void write.finally(() => this.#writes.delete(write));
     }
@@ -391,7 +405,11 @@ export class Coordinator {
                 });
             }
         }
-        const settled = this.#tracker.observe(sessionId, event);
+        const settled = this.#tracker.observe(sessionId, event, {
+            // 只有本协调器名下的单才允许消费；#dispatching 覆盖“已发出 prompt、
+            // 任务行还没建”的窗口。非属主整体跳过，不删除共享 tracker 的条目。
+            owns: requestId => this.#tasks.has(requestId) || this.#dispatching.has(requestId)
+        });
         for (const item of settled) {
             const task = this.#tasks.get(item.requestId);
             if (!task) {
@@ -491,6 +509,11 @@ export class Coordinator {
     /** 当前正处于 prompt 往返中的 requestId：还没落成任务，但消息可能已经发出。 */
     pendingDispatchIds() {
         return [...this.#dispatching];
+    }
+
+    /** 账本写失败记录：最近 20 条，供 ms2_status 暴露，避免失败永远不可见。 */
+    writeErrors() {
+        return this.#writeErrors.map(item => ({ ...item }));
     }
 
     /** 尚未结算的工单。 */

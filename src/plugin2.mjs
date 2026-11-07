@@ -810,7 +810,12 @@ export function apply(ctx, config) {
                         },
                         coordinators: state.coordinators.size
                     },
-                    logTruncated: state.eventLog.truncated === true
+                    logTruncated: state.eventLog.truncated === true,
+                    writeErrors: visible.flatMap(group => {
+                        const coordinator = state.coordinators.get(group.id);
+                        if (coordinator === undefined) return [];
+                        return coordinator.writeErrors().map(item => ({ groupId: group.id, ...item }));
+                    }).slice(-20)
                 });
             }
         },
