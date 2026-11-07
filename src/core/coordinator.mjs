@@ -39,11 +39,13 @@ export class Coordinator {
     #dispatching = new Set();
     // 上报按到达顺序串行处理：同一条单的重复/冲突判断不能并发穿透。
     #reportQueue = Promise.resolve();
+    // 上报成功后唤醒主会话；注入而不是让 coordinator 直接依赖 ctx。
+    #onReported = null;
     // 正在 prompt 往返中的 requestId 由 DeliveryChannel 统一登记（#inflight）。
     // 这里不能只记在本协调器上：同一会话可能同时属于 A、B 两个整体，
     // B 的协调器必须也能认出 A 正在投递的 id。
 
-    constructor({ registry, channel, tracker, ledger, groupId = null } = {}) {
+    constructor({ registry, channel, tracker, ledger, groupId = null, onReported = null } = {}) {
         if (!registry || typeof registry.get !== 'function') throw new Error('COORDINATOR_REGISTRY_REQUIRED');
         if (!channel || typeof channel.deliver !== 'function') throw new Error('COORDINATOR_CHANNEL_REQUIRED');
         if (!tracker || typeof tracker.observe !== 'function') throw new Error('COORDINATOR_TRACKER_REQUIRED');
@@ -51,6 +53,7 @@ export class Coordinator {
         this.#channel = channel;
         this.#tracker = tracker;
         this.#ledger = ledger === undefined ? null : ledger;
+        this.#onReported = typeof onReported === 'function' ? onReported : null;
         // 每个整体一个协调器；账本共用一份，用 groupId 区分归属。
         // 单机/旧测试可以不给 groupId，此时按“只有一个整体”的语义处理。
         this.groupId = typeof groupId === 'string' ? groupId : null;
@@ -353,13 +356,38 @@ export class Coordinator {
         target.reportDetail = detail;
         if (status === 'blocked') target.reason = 'member_blocked';
         else if (status === 'failed') target.reason = 'member_failed';
+
+        // 上报已经落账、内存也已更新，才唤醒主会话；唤醒失败只影响 wake 字段，
+        // 绝不回滚这次上报。self-wake 直接跳过，不产生 prompt。
+        const leadSessionId = typeof this.#registry.lead === 'function' ? this.#registry.lead() : null;
+        let wake = 'skipped-no-lead';
+        if (leadSessionId === caller) {
+            wake = 'skipped-self';
+        } else if (leadSessionId !== null && this.#onReported !== null) {
+            try {
+                const result = this.#onReported({
+                    groupId: this.groupId,
+                    leadSessionId,
+                    reporterSessionId: caller,
+                    taskRequestId: target.requestId,
+                    status,
+                    state: target.state,
+                    label: target.label,
+                    summary: target.result
+                });
+                wake = result && typeof result.status === 'string' ? result.status : 'sent';
+            } catch {
+                wake = 'error';
+            }
+        }
         return {
             requestId: target.requestId,
             taskState: target.state,
             source,
             provisional: target.provisional,
             turn,
-            duplicate: false
+            duplicate: false,
+            wake
         };
     }
 

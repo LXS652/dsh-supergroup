@@ -31,6 +31,7 @@ import { TaskLedger } from './core/ledger.mjs';
 import { DeliveryChannel, ResultTracker } from './core/delivery.mjs';
 import { checkToolAllowed, policiesFor } from './core/roles.mjs';
 import { runCommand } from './core/commands.mjs';
+import { createWaker } from './core/wake.mjs';
 
 export const name = 'dsh-supergroup';
 export const inject = ['tools', 'commands'];
@@ -354,6 +355,15 @@ export function apply(ctx, config) {
         eventLog
     };
     const tracker = new ResultTracker();
+    // 上报唤醒只投给 lead；getController 延迟取，避免 ready 早期拿不到 sessionController。
+    const waker = createWaker({
+        getController() {
+            const controller = ctx.get('sessionController');
+            return controller && typeof controller.prompt === 'function' ? controller : null;
+        }
+    });
+    state.waker = waker;
+    const onReported = payload => waker.wake(payload);
 
     /** 延迟初始化：读盘、建协调器、跑一次恢复。工具执行时等它就绪。 */
     const ready = (async () => {
@@ -400,7 +410,8 @@ export function apply(ctx, config) {
                     channel,
                     tracker,
                     ledger,
-                    groupId: group.id
+                    groupId: group.id,
+                    onReported
                 });
                 state.coordinators.set(group.id, coordinator);
                 // 只有从旧 registry 迁来的整体认领旧账本里没有 groupId 的工单；其它整体不抢。
@@ -815,7 +826,10 @@ export function apply(ctx, config) {
                         const coordinator = state.coordinators.get(group.id);
                         if (coordinator === undefined) return [];
                         return coordinator.writeErrors().map(item => ({ groupId: group.id, ...item }));
-                    }).slice(-20)
+                    }).slice(-20),
+                    wakeErrors: waker.errors()
+                        .filter(item => item.groupId === null || visibleIds.has(item.groupId))
+                        .slice(-20)
                 });
             }
         },
@@ -949,7 +963,8 @@ export function apply(ctx, config) {
                         channel: state.channel,
                         tracker,
                         ledger: new TaskLedger({ file: ledgerFile }),
-                        groupId: group.id
+                        groupId: group.id,
+                        onReported
                     });
                     state.coordinators.set(group.id, coordinator);
                     await state.groups.save();
@@ -1093,7 +1108,8 @@ export function apply(ctx, config) {
                             channel: state.channel,
                             tracker,
                             ledger: new TaskLedger({ file: ledgerFile }),
-                            groupId: group.id
+                            groupId: group.id,
+                            onReported
                         }));
                         await state.groups.save();
                         return { kind: 'success', text: JSON.stringify({ group: group.toJSON() }) };
