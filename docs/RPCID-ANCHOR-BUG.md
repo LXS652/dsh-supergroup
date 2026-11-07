@@ -19,7 +19,7 @@
 
 | # | 问题 | 结论 | 证据 |
 |---|---|---|---|
-| 1 | 持久化里那条用户消息的 source / rpcId / seq | `source={"kind":"user","rpcId":"ms-mw65ylbu-jck67jfd"}`，与派单 id 相等 | `sessions\--E-~4E0B~8F7D--\session-fdac37ee-…\session.v4.jsonl.zstd`，**seq=7093**，`at=1794041459267`（08:50:59.267Z）；同轮另 3 条 user/message 的 kind 是 `runtime-context`/`plugin`/`time-context` |
+| 1 | 持久化里那条用户消息的 source / rpcId / seq | `source={"kind":"user","rpcId":"ms-mw65ylbu-jck67jfd"}`，与派单 id 相等 | `sessions\<工作区>\<成员会话>\session.v4.jsonl.zstd`，**seq=7093**，`at=1794041459267`（08:50:59.267Z）；同轮另 3 条 user/message 的 kind 是 `runtime-context`/`plugin`/`time-context` |
 | 2 | 实时事件里的 source 形状 | 同为 `{kind:"user",rpcId}`，锚定成功 | `session-events.log` 08:50:59.268 `user/message` 无 reason；`missReason`（`plugin2.mjs:1076-1079`）只有 rpcId 命中才不打 `anchor-miss`。08:50:53.955 的 `turn/start anchor-miss` 是锚点消息**之前**的正常前置事件（`delivery.mjs:199` 未锚定不绑 turn） |
 | 3 | bili-whale 成功组的差异 | `source` 形状**完全相同**，没有差异；差异在整体顺序 | bili-whale 持久化 seq=6241（`ms-mw65vkpc-volb9yu6`）、seq=6263（`ms-mw66dts8-95c75k1y`），形状 `{kind:"user",rpcId}`；它们属第一整体 `g-dc0fa950`，settled 无 source（事件快路径） |
 | 4 | 差异出现在哪一层 | **插件的事件分发层**：共享 tracker + 按 map 顺序遍历 | `plugin2.mjs:354` 单例；`:1110-1112` 遍历全部 Coordinator；`coordinator.mjs:246-252` 非属主也消费并塞 earlySettled；`delivery.mjs:219` 删除条目；`coordinator.mjs:196-199` 冲刷条件不满足 |
