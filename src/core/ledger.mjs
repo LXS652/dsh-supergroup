@@ -6,7 +6,7 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const KINDS = new Set(['dispatch', 'settled', 'report', 'human', 'resolve', 'uncertain', 'adopt']);
+const KINDS = new Set(['dispatch', 'settled', 'report', 'human', 'resolve', 'uncertain', 'adopt', 'wake-failed']);
 
 /** 极简账本：内存里也留一份，便于没有文件时做测试。 */
 export class TaskLedger {
@@ -60,6 +60,18 @@ export class TaskLedger {
         });
         this.#queue = task.catch(() => {});
         return task;
+    }
+
+    /**
+     * 取最近 N 条指定 kind 的记录（按写入顺序，最新的在后）。
+     * 唤醒失败不进工单重放，但必须能被状态面板看到；读文件而不是维护
+     * 第二份内存索引，避免与 append 的失败/重启语义分叉。
+     */
+    async recentKind(kind, limit = 20) {
+        if (typeof kind !== 'string' || kind.length === 0) return [];
+        const capped = Number.isSafeInteger(limit) && limit > 0 ? limit : 20;
+        const events = await this.load();
+        return events.filter(event => event.kind === kind).slice(-capped);
     }
 }
 

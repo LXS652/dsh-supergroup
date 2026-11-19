@@ -156,9 +156,12 @@ window.__ModuleLoader__.load({
             }
         }
 
-        function GroupCard({ group, byId, sessions, onOpen, onDissolve, onRename, onUpdateMembers }) {
+        function GroupCard({ group, byId, sessions, wakeEvents, onOpen, onDissolve, onRename, onUpdateMembers }) {
             const members = Array.isArray(group.members) ? group.members : [];
             const sessionRows = Array.isArray(sessions) ? sessions : [];
+            const wakeFailedCount = Array.isArray(wakeEvents)
+                ? wakeEvents.filter((item) => item && item.groupId === group.id).length
+                : 0;
             const [confirming, setConfirming] = React.useState(false);
             const [busy, setBusy] = React.useState(false);
             const [failure, setFailure] = React.useState('');
@@ -255,6 +258,12 @@ window.__ModuleLoader__.load({
                             title: '成员已上报完成，等对账或 turn/end 复核'
                         }, `未核实 ${group.provisional}`)
                         : null,
+                    wakeFailedCount > 0
+                        ? h('span', {
+                            style: { ...S.dim, color: 'var(--dsw-alias-color-danger, #d33)' },
+                            title: '该整体最近有唤醒投递失败，详见下方「通知与唤醒失败」'
+                        }, `唤醒失败 ${wakeFailedCount}`)
+                        : null,
                     h('span', { style: { flex: 1 } }),
                     h('button', {
                         type: 'button',
@@ -340,6 +349,7 @@ window.__ModuleLoader__.load({
             const currentSessionId = props.currentSessionId || props.sessionId || '';
 
             const [groups, setGroups] = React.useState([]);
+            const [wakeEvents, setWakeEvents] = React.useState([]);
             const [error, setError] = React.useState('');
             const [busy, setBusy] = React.useState(false);
             const [foldBatch, setFoldBatch] = React.useState(true);
@@ -379,6 +389,7 @@ window.__ModuleLoader__.load({
                 try {
                     const value = await runCommand(ctx, targetId, '/ms2 panel', true);
                     setGroups(Array.isArray(value.groups) ? value.groups : []);
+                    setWakeEvents(Array.isArray(value.wakeEvents) ? value.wakeEvents : []);
                     setError('');
                 } catch (failure) {
                     setError(String((failure && failure.message) || failure));
@@ -523,11 +534,29 @@ window.__ModuleLoader__.load({
                                 group,
                                 byId,
                                 sessions: wizardSessions,
+                                wakeEvents,
                                 onOpen: open,
                                 onDissolve: dissolve,
                                 onRename: rename,
                                 onUpdateMembers: updateMembers
                             })),
+                        h('div', { style: { ...S.card, marginTop: 8 } },
+                            h('div', { style: { ...S.bar, marginBottom: 6 } },
+                                h('strong', { style: { fontSize: 12 } }, '通知与唤醒失败'),
+                                h('span', { style: S.dim }, '来自账本 wake-failed，重启后仍可见')
+                            ),
+                            wakeEvents.length === 0
+                                ? h('div', { style: S.dim }, '最近没有唤醒失败')
+                                : wakeEvents.map((event, index) => h('div', {
+                                    key: `${event.at || ''}-${event.requestId || index}`,
+                                    style: S.row,
+                                    title: `${event.message || ''}\n${event.requestId || ''}`
+                                },
+                                    h('span', { style: { ...S.dim, minWidth: 84 } }, event.groupName || event.groupId || '未知整体'),
+                                    h('span', { style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, event.summary || event.message || ''),
+                                    h('span', { style: { ...S.error, fontSize: 11 } }, event.code || event.outcome || '')
+                                ))
+                        ),
                         wizard ? h('div', { style: S.wizard },
                             h('div', { style: { fontWeight: 600, marginBottom: 8 } },
                                 step === 1 ? '第 1 步：选主会话' : step === 2 ? '第 2 步：选执行会话' : '第 3 步：给整体命名'),

@@ -218,9 +218,11 @@ test('权限面：跨会话通道只归主会话，名单外会话不受影响',
         // 成员不能直发/派工
         assert.match(String(ask('send_message', MEMBER)), /coordinator-only/);
         assert.match(String(ask('ms2_dispatch', MEMBER)), /MS2_MEMBER_DENIED/);
-        // 成员唯一豁免：精确匹配 ms2_report；前缀相似名仍被拒
+        // 成员只豁免精确匹配的 ms2_report / ms2_notify；前缀相似名仍被拒
         assert.equal(ask('ms2_report', MEMBER), undefined);
+        assert.equal(ask('ms2_notify', MEMBER), undefined);
         assert.match(String(ask('ms2_report_v2', MEMBER)), /MS2_MEMBER_DENIED/);
+        assert.match(String(ask('ms2_notify_v2', MEMBER)), /MS2_MEMBER_DENIED/);
         assert.match(String(ask('ms2_status', MEMBER)), /MS2_MEMBER_DENIED/);
         // 成员的普通业务工具照
         assert.equal(ask('read_file', MEMBER), undefined);

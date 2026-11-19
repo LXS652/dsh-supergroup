@@ -31,7 +31,7 @@ import { TaskLedger } from './core/ledger.mjs';
 import { DeliveryChannel, ResultTracker } from './core/delivery.mjs';
 import { checkToolAllowed, policiesFor } from './core/roles.mjs';
 import { runCommand } from './core/commands.mjs';
-import { createWaker } from './core/wake.mjs';
+import { cleanWakeSummary, createWaker, truncateWakeSummary } from './core/wake.mjs';
 
 export const name = 'dsh-supergroup';
 export const inject = ['tools', 'commands'];
@@ -296,8 +296,8 @@ export function apply(ctx, config) {
     const STARTUP_RECONCILE_INTERVAL_MS = config && Number.isSafeInteger(config.startupReconcileIntervalMs)
         ? Math.min(Math.max(config.startupReconcileIntervalMs, 1), 200)
         : 200;
-    // 成员唯一可用的 ms2_* 工具；必须精确匹配，防止 ms2_report_v2 这类前缀绕过。
-    const MEMBER_REPORT_TOOL = 'ms2_report';
+    // 成员可用的 ms2_* 工具；必须精确匹配，防止 ms2_report_v2 这类前缀绕过。
+    const MEMBER_WAKE_TOOLS = new Set(['ms2_report', 'ms2_notify']);
     const eventLog = {
         file: eventLogFile,
         bytes: 0,
@@ -335,6 +335,9 @@ export function apply(ctx, config) {
         groups: null,
         coordinators: new Map(),
         channel: null,
+        ledger: null,
+        wakeErrors: [],
+        wakeWriteErrors: [],
         error: null,
         recovery: [],
         observeStats: {
@@ -360,6 +363,21 @@ export function apply(ctx, config) {
         getController() {
             const controller = ctx.get('sessionController');
             return controller && typeof controller.prompt === 'function' ? controller : null;
+        },
+        onFailure(entry) {
+            // 内存 ring 兜底：账本写失败或还没 ready 时，面板仍能看见。
+            state.wakeErrors.push(entry);
+            if (state.wakeErrors.length > 20) state.wakeErrors.splice(0, state.wakeErrors.length - 20);
+            const ledger = state.ledger;
+            if (ledger === null) return;
+            ledger.append({ kind: 'wake-failed', ...entry }).catch(error => {
+                state.wakeWriteErrors.push({
+                    at: new Date().toISOString(),
+                    message: error instanceof Error ? error.message : String(error),
+                    requestId: entry.requestId
+                });
+                if (state.wakeWriteErrors.length > 20) state.wakeWriteErrors.splice(0, state.wakeWriteErrors.length - 20);
+            });
         }
     });
     state.waker = waker;
@@ -385,6 +403,7 @@ export function apply(ctx, config) {
                 }
             });
             const ledger = new TaskLedger({ file: ledgerFile });
+            state.ledger = ledger;
             state.channel = channel;
             // 配置里可以预置整体：只在同名整体不存在时创建，重启不会重复建。
             const bootstrapNotes = [];
@@ -446,6 +465,55 @@ export function apply(ctx, config) {
                 provisional: tasks.filter(task => task.state === 'completed' && task.provisional === true).length
             };
         });
+    }
+
+    /**
+     * 唤醒失败面板数据：账本为主、内存 ring 兜底，按可见整体过滤后取最近 20 条。
+     * 只读，不改变任何工单状态。
+     */
+    async function wakeEventsFor(visibleIds) {
+        const merged = new Map();
+        const add = item => {
+            if (item === null || typeof item !== 'object') return;
+            if (typeof item.groupId === 'string' && !visibleIds.has(item.groupId)) return;
+            const key = `${item.at === undefined ? '' : item.at}|${item.requestId === undefined ? '' : item.requestId}|${item.code === undefined ? '' : item.code}|${item.outcome === undefined ? '' : item.outcome}`;
+            if (!merged.has(key)) merged.set(key, item);
+        };
+        for (const item of state.wakeErrors) add(item);
+        if (state.ledger !== null) {
+            try {
+                for (const item of await state.ledger.recentKind('wake-failed', 200)) add(item);
+            } catch (error) {
+                state.wakeWriteErrors.push({
+                    at: new Date().toISOString(),
+                    message: error instanceof Error ? error.message : String(error),
+                    requestId: null
+                });
+                if (state.wakeWriteErrors.length > 20) state.wakeWriteErrors.splice(0, state.wakeWriteErrors.length - 20);
+            }
+        }
+        return [...merged.values()]
+            .sort((left, right) => String(right.at === undefined ? '' : right.at).localeCompare(String(left.at === undefined ? '' : left.at)))
+            .slice(0, 20)
+            .map(item => {
+                const group = state.groups !== null && typeof item.groupId === 'string' ? state.groups.get(item.groupId) : undefined;
+                const member = group !== undefined && typeof item.memberSessionId === 'string'
+                    ? group.registry.get(item.memberSessionId)
+                    : undefined;
+                return {
+                    at: item.at === undefined ? null : item.at,
+                    groupId: item.groupId === undefined ? null : item.groupId,
+                    groupName: group === undefined ? null : group.name,
+                    memberSessionId: item.memberSessionId === undefined ? null : item.memberSessionId,
+                    memberLabel: member === undefined ? (item.memberSessionId === undefined ? null : item.memberSessionId) : member.label,
+                    outcome: item.outcome === undefined ? null : item.outcome,
+                    code: item.code === undefined ? null : item.code,
+                    message: item.message === undefined ? null : item.message,
+                    summary: item.summary === undefined ? null : item.summary,
+                    requestId: item.requestId === undefined ? null : item.requestId,
+                    retryAfterMs: item.retryAfterMs === undefined ? null : item.retryAfterMs
+                };
+            });
     }
 
     /** 调用者能看到的整体：自己当主会话的，或自己当成员的。 */
@@ -829,8 +897,93 @@ export function apply(ctx, config) {
                     }).slice(-20),
                     wakeErrors: waker.errors()
                         .filter(item => item.groupId === null || visibleIds.has(item.groupId))
-                        .slice(-20)
+                        .slice(-20),
+                    wakeEvents: await wakeEventsFor(visibleIds),
+                    wakeWriteErrors: state.wakeWriteErrors.slice(-20)
                 });
+            }
+        },
+        {
+            definition: toolDefinition(
+                'ms2_notify',
+                '通知你所在整体的主会话（不需要工单）。summary 必填；同一摘要 60 秒内只唤醒一次；每分钟最多 6 条。',
+                '{"summary":"...","detail":"..."}'
+            ),
+            async execute(args, exec) {
+                const failed = await readyError();
+                if (failed !== null) return reply('error', failed.summary, { code: 'NOTIFY_NOT_READY' });
+                const caller = exec && exec.agent && exec.agent.id;
+                if (typeof caller !== 'string' || caller.length === 0) {
+                    return reply('error', 'NOTIFY_BAD_ARGUMENT: 无法识别调用会话', { code: 'NOTIFY_BAD_ARGUMENT' });
+                }
+                let payload;
+                try {
+                    payload = parseJson(args && args.request, '{"summary":"...","detail":"..."}');
+                } catch (error) {
+                    return reply('error', `NOTIFY_BAD_ARGUMENT: ${error instanceof Error ? error.message : String(error)}`, { code: 'NOTIFY_BAD_ARGUMENT' });
+                }
+                if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+                    return reply('error', 'NOTIFY_BAD_ARGUMENT: request 必须是 JSON 对象', { code: 'NOTIFY_BAD_ARGUMENT' });
+                }
+                for (const key of Object.keys(payload)) {
+                    if (key !== 'summary' && key !== 'detail') {
+                        return reply('error', `NOTIFY_BAD_ARGUMENT: 不接受字段 ${key}；身份只从调用会话推断`, { code: 'NOTIFY_BAD_ARGUMENT' });
+                    }
+                }
+                if (typeof payload.summary !== 'string' || cleanWakeSummary(payload.summary).length === 0) {
+                    return reply('error', 'NOTIFY_BAD_ARGUMENT: summary 必填且不能为空', { code: 'NOTIFY_BAD_ARGUMENT' });
+                }
+                let detail = null;
+                if (payload.detail !== undefined && payload.detail !== null) {
+                    if (typeof payload.detail !== 'string') {
+                        return reply('error', 'NOTIFY_BAD_ARGUMENT: detail 必须是字符串', { code: 'NOTIFY_BAD_ARGUMENT' });
+                    }
+                    const cleanedDetail = cleanWakeSummary(payload.detail);
+                    if ([...cleanedDetail].length > 2000) {
+                        return reply('error', 'NOTIFY_BAD_ARGUMENT: detail 超过 2000 字', { code: 'NOTIFY_BAD_ARGUMENT' });
+                    }
+                    detail = cleanedDetail;
+                }
+                const memberships = state.groups === null ? [] : state.groups.groupsWithMember(caller);
+                if (memberships.length === 0) {
+                    return reply('error', 'NOTIFY_NO_GROUP: 你不在任何整体里，无法通知主会话', { code: 'NOTIFY_NO_GROUP' });
+                }
+                if (memberships.length > 1) {
+                    return reply('error', 'NOTIFY_AMBIGUOUS: 你同时属于多个整体，请先明确归属', {
+                        code: 'NOTIFY_AMBIGUOUS',
+                        candidates: memberships.map(group => ({ id: group.id, name: group.name, lead: group.registry.lead() }))
+                    });
+                }
+                const group = memberships[0];
+                const member = group.registry.get(caller);
+                const summary = cleanWakeSummary(payload.summary);
+                const outcome = await waker.wakeNotify({
+                    groupId: group.id,
+                    groupName: group.name,
+                    leadSessionId: group.registry.lead(),
+                    reporterSessionId: caller,
+                    label: member === undefined ? null : member.label,
+                    summary,
+                    detail
+                });
+                const data = {
+                    wake: outcome.status,
+                    groupId: group.id,
+                    groupName: group.name,
+                    leadSessionId: group.registry.lead(),
+                    requestId: outcome.requestId === undefined ? null : outcome.requestId,
+                    dedupeKey: outcome.dedupeKey === undefined ? null : outcome.dedupeKey
+                };
+                if (outcome.wakeCode !== undefined) data.wakeCode = outcome.wakeCode;
+                if (outcome.retryAfterMs !== undefined) data.retryAfterMs = outcome.retryAfterMs;
+                const label = outcome.status === 'sent'
+                    ? '通知已发送给主会话'
+                    : (outcome.status === 'duplicate'
+                        ? '同一摘要在 60 秒内已通知过，未重复发送'
+                        : (outcome.status === 'rate-limited'
+                            ? '通知太频繁，已限流；失败已记录'
+                            : (outcome.status === 'skipped-self' ? '上报者就是主会话，跳过' : '通知未送达，失败已记录')));
+                return reply('ok', label, data);
             }
         },
         {
@@ -1090,7 +1243,9 @@ export function apply(ctx, config) {
                     } catch (error) {
                         state.observeStats.lastReconcileError = error instanceof Error ? error.message : String(error);
                     }
-                    return { kind: 'success', text: JSON.stringify({ groups: groupsSnapshot() }) };
+                    const groups = groupsSnapshot();
+                    const wakeEvents = await wakeEventsFor(new Set(groups.map(group => group.id)));
+                    return { kind: 'success', text: JSON.stringify({ groups, wakeEvents }) };
                 }
                 if (text === 'create' || text.startsWith('create ')) {
                     await ready;
@@ -1271,7 +1426,7 @@ export function apply(ctx, config) {
             // 按当前名单现算，不查可能过期的缓存：成员被移除后必须立刻恢复普通权限。
             const memberships = groups.filter(group => group.registry.get(caller) !== undefined);
             if (memberships.length === 0) return;
-            if (typeof exec.name === 'string' && exec.name.startsWith('ms2_') && exec.name !== MEMBER_REPORT_TOOL) {
+            if (typeof exec.name === 'string' && exec.name.startsWith('ms2_') && !MEMBER_WAKE_TOOLS.has(exec.name)) {
                 return 'MS2_MEMBER_DENIED: 成员不能直接使用协调体工具，请经主会话';
             }
             for (const group of memberships) {
