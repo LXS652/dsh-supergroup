@@ -17,6 +17,7 @@ import {
     mkdirSync,
     openSync,
     readFileSync,
+    renameSync,
     statSync,
     unlinkSync,
     writeFileSync,
@@ -304,14 +305,37 @@ export function apply(ctx, config) {
         truncated: false,
         error: null
     };
+
+    /**
+     * 到上限时只保留一代 .1：先删旧 .1，再把当前文件改名过去，当前文件从 0 继续写。
+     * 轮转失败只把 eventLog 标成 truncated 并留错误，绝不让日志拖垮归集。
+     */
+    function rotateEventLog() {
+        const rotated = `${eventLog.file}.1`;
+        try {
+            mkdirSync(dirname(eventLog.file), { recursive: true });
+            if (existsSync(rotated)) unlinkSync(rotated);
+            if (existsSync(eventLog.file)) renameSync(eventLog.file, rotated);
+            eventLog.bytes = 0;
+            eventLog.truncated = false;
+            eventLog.error = null;
+            return true;
+        } catch (error) {
+            eventLog.error = error instanceof Error ? error.message : String(error);
+            eventLog.truncated = true;
+            return false;
+        }
+    }
+
     try {
         if (existsSync(eventLogFile)) eventLog.bytes = statSync(eventLogFile).size;
-        if (eventLog.bytes >= EVENT_LOG_LIMIT) eventLog.truncated = true;
+        // 上次进程可能正好停在上限；启动时先轮转，别让旧文件把诊断通道永久锁死。
+        if (eventLog.bytes >= EVENT_LOG_LIMIT) rotateEventLog();
     } catch (error) {
         eventLog.error = error instanceof Error ? error.message : String(error);
     }
 
-    /** 只追加紧凑的观测字段，永远不写消息正文；到上限就停止，不删旧行。 */
+    /** 只追加紧凑的观测字段，永远不写消息正文；到上限轮转一代，不删旧行。 */
     function appendEventLog(entry) {
         if (eventLog.truncated) return;
         const line = `${JSON.stringify(entry)}\n`;
@@ -319,7 +343,7 @@ export function apply(ctx, config) {
             mkdirSync(dirname(eventLog.file), { recursive: true });
             appendFileSync(eventLog.file, line, 'utf8');
             eventLog.bytes += Buffer.byteLength(line);
-            if (eventLog.bytes >= EVENT_LOG_LIMIT) eventLog.truncated = true;
+            if (eventLog.bytes >= EVENT_LOG_LIMIT) rotateEventLog();
         } catch (error) {
             // 日志写不进去不能拖垮归集；状态里留一次错误，避免每个事件都重试刷屏。
             eventLog.error = error instanceof Error ? error.message : String(error);

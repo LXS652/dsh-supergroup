@@ -62,7 +62,7 @@ node --check client/client.js
 node --test tests/*.test.mjs
 ```
 
-结果：**179 tests / 179 pass / 0 fail**。其中 `tests/notify.test.mjs` 12 条：
+结果：**182 tests / 182 pass / 0 fail**。其中 `tests/notify.test.mjs` 12 条：
 
 1. 正常通知：模板、lead、requestId；
 2. 无整体 → `NOTIFY_NO_GROUP`；
@@ -83,7 +83,7 @@ node --test tests/*.test.mjs
 
 | 编号 | 操作 | 判定依据 |
 | --- | --- | --- |
-| A1 | lead 空闲；成员执行 `ms2_notify {summary:"A1 ping"}` | 返回 `wake:"sent"`；≤60 秒内 lead 出现新回合；`session-events.log` 有 `agent/inbox/spliced`，`rpcId` 以 `ms-wake-notify-` 开头；回合内可见「[成员通知] … A1 ping」 |
+| A1 | lead 空闲；成员执行 `ms2_notify {summary:"A1 ping"}` | 返回 `wake:"sent"`；≤60 秒内 lead 出现新回合；判定依据改为 lead 会话日志里的 `user/message` 带 `ms-wake-notify-` 前缀，或轮转后的 `session-events.log` / `session-events.log.1`；回合内可见「[成员通知] … A1 ping」 |
 | A2 | lead 正在跑长回合；成员连发 2 条不同摘要 | 两条都 `wake:"sent"`；`spliced` 的 `target` 为 `next-turn`；当前回合不被打断；下一回合依次看到两条 |
 | A3 | 同一成员 60 秒内连发 10 条相同摘要 | 第一次 `sent`，其余 9 次 `duplicate`；lead 只被叫起 1 次；账本 0 条 `wake-failed` |
 | A4 | 同一成员 60 秒内发 8 条不同摘要 | 前 6 条 `sent`，后 2 条 `rate-limited`（`retryAfterMs>0`）；账本 2 行 `wake-failed`，`code=WAKE_RATE_LIMITED`；面板显示这 2 条 |
@@ -95,3 +95,14 @@ node --test tests/*.test.mjs
 1. `%DSH_HOME%\supergroup\tasks.jsonl` 是否出现 `"kind":"wake-failed"`，字段是否含 `code`、`outcome`、`maybeQueued`；
 2. `ms2_status.data.wakeEvents` 是否与面板「通知与唤醒失败」一致；
 3. `ms2_notify` 在单整体成员下返回的 `requestId` 是否以 `ms-wake-notify-` 开头，且 lead 回合内文本格式正确。
+
+## 6. 观测日志轮转（W14）
+
+`session-events.log` 仍以 256 KiB 为上限，但不再“到上限永久停写”：
+
+- 达到上限时把当前文件改名为同目录 `session-events.log.1`（覆盖旧 `.1`，只保留一代），当前文件从 0 继续写；
+- 启动时若发现文件已超上限，也先按同样规则轮转；
+- 轮转失败（例如 `.1` 被目录占用）只置 `logTruncated: true` 并记录错误，绝不抛出、不影响归集；
+- 不新增定时器，也不改变 `ms2_status.logTruncated` 的语义。
+
+新增 3 条测试：启动超限轮转、写入达上限轮转并继续写、轮转失败置位不抛错。因此 A1 的 `spliced` 判定改为看 lead 会话日志，或看轮转后的 `session-events.log` / `.1`，旧日志停写不再作为唯一依据。

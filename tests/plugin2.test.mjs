@@ -1,7 +1,8 @@
 /** 插件接线单测：用假宿主验证工具面、权限面与事件归集，不启动真DSH'*/
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/plugin2.mjs';
@@ -30,7 +31,7 @@ async function waitFor(predicate, timeoutMs = 3000) {
 }
 
 /** 造一份落盘名'+ 假宿主；返回注册表、宿主句柄与已注册工具'*/
-async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, controllerDelay = 0, startupReconcileAttempts, startupReconcileIntervalMs, breakLedger = false } = {}) {
+async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, controllerDelay = 0, startupReconcileAttempts, startupReconcileIntervalMs, breakLedger = false, eventLogSetup } = {}) {
     const directory = await mkdtemp(join(tmpdir(), 'ms2-host-'));
     const file = join(directory, 'registry.json');
     let ledgerFile = join(directory, 'tasks.jsonl');
@@ -40,6 +41,8 @@ async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, control
         await writeFile(blocker, 'not a directory', 'utf8');
         ledgerFile = join(blocker, 'tasks.jsonl');
     }
+    const eventLogFile = join(directory, 'session-events.log');
+    if (typeof eventLogSetup === 'function') await eventLogSetup(directory, eventLogFile);
     const registry = new SessionRegistry({ lead: LEAD, members: [{ sessionId: MEMBER, roleClass: 'assistant' }] }, { file });
     await registry.save();
     if (Array.isArray(ledgerRecords) && ledgerRecords.length > 0) {
@@ -115,7 +118,7 @@ async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, control
     apply(ctx, {
         registryFile: file,
         ledgerFile,
-        eventsLogFile: join(directory, 'session-events.log'),
+        eventsLogFile: eventLogFile,
         startupReconcileAttempts,
         startupReconcileIntervalMs,
         selfTest
@@ -153,7 +156,7 @@ async function makeHost({ prompt, selfTest, historyPages, ledgerRecords, control
         assert.ok(definition, '命令 ms2 未注');
         return definition.handler({ commandId: 'cmd-1', agent, rawInput, attachments: [], signal: undefined });
     };
-    return { ctx, tools, calls, pageCalls, guards, handlers, commands: commandDefs, runCommand, registry, file, directory, ledgerFile, eventLog: join(directory, 'session-events.log'), call, render, emit, emitRaw, cleanup, listeners, toolsRegistry: tools };
+    return { ctx, tools, calls, pageCalls, guards, handlers, commands: commandDefs, runCommand, registry, file, directory, ledgerFile, eventLog: eventLogFile, call, render, emit, emitRaw, cleanup, listeners, toolsRegistry: tools };
 }
 
 test('主会话能派工，成员不能；参数校验与拒绝都可读', async () => {
@@ -285,6 +288,76 @@ test('事件观测：双处监听同一条事件只结算一次，日志只记�
         assert.deepEqual(lines.map(line => line.type), ['turn/start', 'user/message', 'assistant/message', 'turn/end']);
         assert.ok(lines.every(line => line.sessionId === MEMBER && typeof line.at === 'string'));
         assert.ok(lines.every(line => !('text' in line) && !('message' in line)), '日志不能写消息正');
+    } finally {
+        await host.cleanup();
+    }
+});
+
+test('事件日志：启动时已超上限先轮转，当前文件重新可写', async () => {
+    const limit = 256 * 1024;
+    const host = await makeHost({
+        eventLogSetup: async (_directory, file) => {
+            await writeFile(file, 'x'.repeat(limit + 120), 'utf8');
+        }
+    });
+    try {
+        assert.equal(existsSync(`${host.eventLog}.1`), true, '启动时应当把超限文件轮转为 .1');
+        assert.equal(existsSync(host.eventLog), false, '轮转后当前文件应由下一条事件重新创建');
+
+        host.emit(MEMBER, { type: 'turn/start', data: { turn: 1 } });
+        const lines = (await readFile(host.eventLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+        assert.equal(lines.length, 1);
+        assert.equal(lines[0].type, 'turn/start');
+
+        const payload = JSON.parse((await host.call('ms2_status', { request: '' }, LEAD)).data);
+        assert.equal(payload.logTruncated, false, '轮转成功后不应再标记 truncated');
+    } finally {
+        await host.cleanup();
+    }
+});
+
+test('事件日志：写入达到上限后轮转，后续继续写', async () => {
+    const limit = 256 * 1024;
+    const host = await makeHost({
+        eventLogSetup: async (_directory, file) => {
+            await writeFile(file, 'x'.repeat(limit - 20), 'utf8');
+        }
+    });
+    try {
+        host.emit(MEMBER, { type: 'turn/start', data: { turn: 2 } });
+        assert.equal(existsSync(`${host.eventLog}.1`), true, '达到上限后应生成 .1');
+        assert.equal(existsSync(host.eventLog), false, '轮转后当前文件为空，等待下一条事件');
+
+        host.emit(MEMBER, { type: 'turn/start', data: { turn: 3 } });
+        const lines = (await readFile(host.eventLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+        assert.equal(lines.length, 1);
+        assert.equal(lines[0].turn, 3);
+
+        const payload = JSON.parse((await host.call('ms2_status', { request: '' }, LEAD)).data);
+        assert.equal(payload.logTruncated, false);
+    } finally {
+        await host.cleanup();
+    }
+});
+
+test('事件日志：轮转失败只置 truncated，不抛错也不影响后续', async () => {
+    const limit = 256 * 1024;
+    const host = await makeHost({
+        eventLogSetup: async (_directory, file) => {
+            await writeFile(file, 'x'.repeat(limit - 20), 'utf8');
+            // 让 .1 是目录，rename/unlink 都无法覆盖，稳定制造轮转失败。
+            await mkdir(`${file}.1`);
+        }
+    });
+    try {
+        host.emit(MEMBER, { type: 'turn/start', data: { turn: 4 } });
+        const payload = JSON.parse((await host.call('ms2_status', { request: '' }, LEAD)).data);
+        assert.equal(payload.logTruncated, true, '轮转失败应当置 truncated');
+
+        host.emit(MEMBER, { type: 'turn/start', data: { turn: 5 } });
+        const text = await readFile(host.eventLog, 'utf8');
+        assert.equal((text.match(/\n/g) || []).length, 1, 'truncated 后停止追加，但不抛错');
+        assert.match(text, /"turn":4/);
     } finally {
         await host.cleanup();
     }
